@@ -1,0 +1,26 @@
+[package]
+name = "sky-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "solara-sky"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sky-api.workspace = true
+sky-protocol.workspace = true
+sky-world.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name (e.g. v0.1.0-alpha.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            bin: solara-sky
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            bin: solara-sky.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Determine Release Tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build Release Binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin solara-sky
+      - name: Package Archive (Linux)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" LICENSE README.md dist/
+          tar -czf "solara-sky-${{ steps.tag.outputs.name }}-${{ matrix.label }}.tar.gz" -C dist .
+      - name: Package Archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}", "LICENSE", "README.md" dist/
+          Compress-Archive -Path dist/* -DestinationPath "solara-sky-${{ steps.tag.outputs.name }}-${{ matrix.label }}.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.label }}
+          path: |
+            solara-sky-*.tar.gz
+            solara-sky-*.zip
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum solara-sky-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Determine Release Tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Solara-Sky ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          files: |
+            artifacts/solara-sky-*
+            artifacts/SHA256SUMS.txt

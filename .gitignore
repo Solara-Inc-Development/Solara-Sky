@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+Thumbs.db
+
+# Runtime server files
+/world
+/world_nether
+/world_the_end
+/logs
+/plugins
+/server.properties
+/solara-sky.toml
+/ops.json
+/whitelist.json
+/banned-players.json
+/banned-ips.json
+/usercache.json

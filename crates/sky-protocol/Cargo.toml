@@ -1,0 +1,22 @@
+[package]
+name = "sky-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes.workspace = true
+bytes.workspace = true
+cfb8.workspace = true
+cipher.workspace = true
+flate2.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+num-bigint.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
