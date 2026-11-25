@@ -6,21 +6,29 @@ use rsa::{Pkcs1v15Encrypt, RsaPrivateKey};
 use serde::Deserialize;
 use sky_api::{PlayerPreLoginEvent, PluginManager, StatusPingEvent};
 use sky_protocol::buf::{PacketReader, PacketWriter};
+use sky_protocol::config_play::{
+    AcceptTeleportC2s, GAME_EVENT_START_WAITING_CHUNKS, GameMode, KnownPack, PlayLoginS2c,
+    decode_select_known_packs, encode_brand_payload, encode_enabled_features, encode_game_event,
+    encode_nbt_disconnect, encode_player_position, encode_registry_data_known,
+    encode_select_known_packs, encode_set_chunk_cache_center, encode_update_tags,
+};
 use sky_protocol::crypto::{MinecraftCipher, mojang_server_hash};
 use sky_protocol::error::ProtocolError;
 use sky_protocol::frame::{MAX_WIRE_FRAME_BYTES, decode_frame_body, encode_frame};
-use sky_protocol::generated_packets;
 use sky_protocol::packets::{
     ClientIntent, HandshakeC2s, LoginCompressionS2c, LoginCustomQueryAnswerC2s,
-    LoginCustomQueryS2c, LoginDisconnectS2c, LoginHelloC2s, LoginHelloS2c, LoginKeyC2s,
-    ProfileProperty, ServerStatusJson, offline_player_uuid, parse_bungeecord_address,
+    LoginCustomQueryS2c, LoginDisconnectS2c, LoginFinishedS2c, LoginHelloC2s, LoginHelloS2c,
+    LoginKeyC2s, ProfileProperty, ServerStatusJson, offline_player_uuid, parse_bungeecord_address,
 };
 use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
 };
+use sky_protocol::{generated_packets, generated_registries};
+use sky_world::{ChunkPos, WorldChunk};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -33,6 +41,9 @@ pub struct SharedServerState {
     pub http: reqwest::Client,
     pub plugins: PluginManager,
     pub online_players: AtomicUsize,
+    pub next_entity_id: AtomicI32,
+    /// Pre-serialized `ClientboundLevelChunkWithLightPacket` payloads for the spawn region.
+    pub spawn_chunk_packets: Vec<Vec<u8>>,
 }
 
 impl SharedServerState {
@@ -57,9 +68,19 @@ impl SharedServerState {
 
         let http = reqwest::Client::builder()
             .user_agent("Solara-Sky/0.1")
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
             .build()
             .context("build HTTP client")?;
+
+        let radius = i32::from(props.view_distance.clamp(2, 6));
+        let mut spawn_chunk_packets =
+            Vec::with_capacity(((2 * radius + 1) * (2 * radius + 1)) as usize);
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                let chunk = WorldChunk::generate_spawn_world(ChunkPos { x: cx, z: cz });
+                spawn_chunk_packets.push(chunk.encode_level_chunk_with_light(false));
+            }
+        }
 
         Ok(Self {
             props,
@@ -68,7 +89,24 @@ impl SharedServerState {
             http,
             plugins,
             online_players: AtomicUsize::new(0),
+            next_entity_id: AtomicI32::new(1),
+            spawn_chunk_packets,
         })
+    }
+}
+
+struct OnlinePlayerGuard<'a>(&'a AtomicUsize);
+
+impl<'a> OnlinePlayerGuard<'a> {
+    fn acquire(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for OnlinePlayerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -110,7 +148,6 @@ impl FramedConnection {
     }
 
     async fn read_packet(&mut self) -> Result<Option<(i32, Vec<u8>)>, ProtocolError> {
-        // Read frame length VarInt byte-by-byte (graceful None if client closed cleanly at boundary)
         let mut num_read = 0usize;
         let mut frame_len_u32 = 0u32;
         loop {
@@ -277,6 +314,11 @@ async fn handle_login(
         return Ok(());
     }
 
+    if state.online_players.load(Ordering::Relaxed) >= state.props.max_players {
+        send_login_disconnect(conn, "The server is full!").await?;
+        return Ok(());
+    }
+
     let Some((pkt_id, payload)) = conn.read_packet().await? else {
         return Ok(());
     };
@@ -387,7 +429,6 @@ async fn handle_login(
                     return Ok(());
                 };
 
-                // Enable AES-128-CFB8 stream encryption immediately after ServerboundKeyPacket
                 conn.enable_encryption(&secret_arr);
 
                 let server_hash = mojang_server_hash("", &secret_arr, pub_der);
@@ -448,22 +489,212 @@ async fn handle_login(
         return Ok(());
     }
 
-    info!(
-        username = %username,
-        %uuid,
-        ip = %effective_ip,
-        props = properties.len(),
-        "authenticated player login"
-    );
+    let session_id = Uuid::new_v4();
+    let finished = LoginFinishedS2c {
+        uuid,
+        username: username.clone(),
+        properties,
+        session_id,
+    };
+    conn.send_packet(LoginFinishedS2c::PACKET_ID, &finished.encode())
+        .await?;
 
-    // Phase 0/1 honest login completion notice until Phase 2 Configuration + Play world streaming lands.
-    send_login_disconnect(
-        conn,
-        format!(
-            "Solara-Sky MC 26.3: Authenticated {} ({})! World streaming lands in Phase 2.",
-            username, uuid
-        ),
+    // Wait for ServerboundLoginAcknowledgedPacket to enter Configuration state
+    let Some((ack_id, _)) = conn.read_packet().await? else {
+        return Ok(());
+    };
+    if ack_id != generated_packets::login::serverbound::LOGIN_ACKNOWLEDGED {
+        bail!("expected LoginAcknowledged (0x03), got 0x{ack_id:02X}");
+    }
+
+    info!(username = %username, %uuid, ip = %effective_ip, "player entered Configuration state");
+    if !handle_configuration(conn, &username).await? {
+        return Ok(());
+    }
+
+    handle_play(conn, &username, uuid, state).await
+}
+
+async fn handle_configuration(conn: &mut FramedConnection, username: &str) -> Result<bool> {
+    use generated_packets::configuration::{clientbound as s2c, serverbound as c2s};
+
+    conn.send_packet(s2c::CUSTOM_PAYLOAD, &encode_brand_payload("solara-sky"))
+        .await?;
+    conn.send_packet(
+        s2c::UPDATE_ENABLED_FEATURES,
+        &encode_enabled_features(&["minecraft:vanilla"]),
     )
     .await?;
-    Ok(())
+    let core_pack = KnownPack::vanilla_core();
+    conn.send_packet(
+        s2c::SELECT_KNOWN_PACKS,
+        &encode_select_known_packs(std::slice::from_ref(&core_pack)),
+    )
+    .await?;
+
+    while let Some((pkt_id, payload)) = conn.read_packet().await? {
+        match pkt_id {
+            c2s::CLIENT_INFORMATION | c2s::CUSTOM_PAYLOAD | c2s::RESOURCE_PACK => {
+                // Accepted cleanly
+            }
+            c2s::KEEP_ALIVE | c2s::PONG => {}
+            c2s::SELECT_KNOWN_PACKS => {
+                let mut r = PacketReader::new(&payload);
+                let client_packs = decode_select_known_packs(&mut r)?;
+                if !client_packs.contains(&core_pack) {
+                    conn.send_packet(
+                        s2c::DISCONNECT,
+                        &encode_nbt_disconnect(
+                            "Client did not advertise vanilla minecraft:core 26.3 data pack.",
+                        ),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+
+                // Stream all 32 synchronized dynamic registries + 773 vanilla network tags
+                for &(reg_id, entries) in generated_registries::SYNCHRONIZED_REGISTRIES {
+                    let reg_bytes = encode_registry_data_known(reg_id, entries);
+                    conn.send_packet(s2c::REGISTRY_DATA, &reg_bytes).await?;
+                }
+                let tags_bytes = encode_update_tags(generated_registries::VANILLA_NETWORK_TAGS);
+                conn.send_packet(s2c::UPDATE_TAGS, &tags_bytes).await?;
+
+                conn.send_packet(s2c::FINISH_CONFIGURATION, &[]).await?;
+            }
+            c2s::FINISH_CONFIGURATION => {
+                debug!(%username, "Configuration state completed");
+                return Ok(true);
+            }
+            other => {
+                debug!(%username, pkt_id = other, "ignoring unhandled Configuration packet");
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn handle_play(
+    conn: &mut FramedConnection,
+    username: &str,
+    uuid: Uuid,
+    state: &SharedServerState,
+) -> Result<()> {
+    use generated_packets::play::{clientbound as s2c, serverbound as c2s};
+
+    let _online_guard = OnlinePlayerGuard::acquire(&state.online_players);
+    let entity_id = state.next_entity_id.fetch_add(1, Ordering::Relaxed);
+
+    // Determine index of "minecraft:overworld" inside synchronized dimension_type registry
+    let overworld_dim_id = generated_registries::SYNCHRONIZED_REGISTRIES
+        .iter()
+        .find(|&&(reg, _)| reg == "minecraft:dimension_type")
+        .and_then(|(_, entries)| entries.iter().position(|&e| e == "minecraft:overworld"))
+        .unwrap_or(0) as i32;
+
+    let radius = i32::from(state.props.view_distance.clamp(2, 6));
+    let login_pkt = PlayLoginS2c {
+        entity_id,
+        hardcore: false,
+        dimension_names: vec!["minecraft:overworld".into()],
+        max_players: state.props.max_players as i32,
+        view_distance: radius,
+        simulation_distance: radius,
+        reduced_debug_info: false,
+        show_death_screen: true,
+        do_limited_crafting: false,
+        dimension_type_id: overworld_dim_id,
+        dimension_name: "minecraft:overworld".into(),
+        hashed_seed: 0x501A_2A26_3000_0777,
+        game_mode: GameMode::from_name(&state.props.gamemode),
+        is_debug: false,
+        is_flat: true,
+        portal_cooldown: 0,
+        sea_level: -60,
+        online_mode: state.props.online_mode,
+        enforces_secure_chat: false,
+    };
+    conn.send_packet(s2c::LOGIN, &login_pkt.encode()).await?;
+
+    conn.send_packet(
+        s2c::SET_CHUNK_CACHE_CENTER,
+        &encode_set_chunk_cache_center(0, 0),
+    )
+    .await?;
+    conn.send_packet(
+        s2c::GAME_EVENT,
+        &encode_game_event(GAME_EVENT_START_WAITING_CHUNKS, 0.0),
+    )
+    .await?;
+
+    for chunk_bytes in &state.spawn_chunk_packets {
+        conn.send_packet(s2c::LEVEL_CHUNK_WITH_LIGHT, chunk_bytes)
+            .await?;
+    }
+
+    let spawn_pos = [8.0, -58.0, 8.0];
+    conn.send_packet(
+        s2c::PLAYER_POSITION,
+        &encode_player_position(1, spawn_pos, 0.0, 0.0),
+    )
+    .await?;
+
+    info!(
+        %username,
+        %uuid,
+        entity_id,
+        chunks = state.spawn_chunk_packets.len(),
+        "player spawned in Solara-Sky world"
+    );
+
+    let mut keep_alive_tick = tokio::time::interval(Duration::from_secs(10));
+    // Consume immediate first tick
+    keep_alive_tick.tick().await;
+    let mut player_pos = spawn_pos;
+
+    loop {
+        tokio::select! {
+            _ = keep_alive_tick.tick() => {
+                let id = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let mut w = PacketWriter::with_capacity(8);
+                w.write_i64(id);
+                conn.send_packet(s2c::KEEP_ALIVE, w.as_slice()).await?;
+            }
+            pkt_res = conn.read_packet() => {
+                let Some((pkt_id, payload)) = pkt_res? else {
+                    info!(%username, "player disconnected cleanly");
+                    return Ok(());
+                };
+                match pkt_id {
+                    c2s::ACCEPT_TELEPORTATION => {
+                        let mut r = PacketReader::new(&payload);
+                        let ack = AcceptTeleportC2s::decode(&mut r)?;
+                        player_pos = [ack.x, ack.y, ack.z];
+                    }
+                    c2s::MOVE_PLAYER_POS => {
+                        let mut r = PacketReader::new(&payload);
+                        player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+                    }
+                    c2s::MOVE_PLAYER_POS_ROT => {
+                        let mut r = PacketReader::new(&payload);
+                        player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+                    }
+                    c2s::KEEP_ALIVE
+                    | c2s::MOVE_PLAYER_ROT
+                    | c2s::MOVE_PLAYER_STATUS_ONLY
+                    | c2s::CLIENT_TICK_END
+                    | c2s::PLAYER_LOADED
+                    | c2s::CHUNK_BATCH_RECEIVED
+                    | c2s::CLIENT_INFORMATION
+                    | c2s::CUSTOM_PAYLOAD => {}
+                    other => {
+                        debug!(%username, pkt_id = other, pos = ?player_pos, "ignoring unhandled Play packet");
+                    }
+                }
+            }
+        }
+    }
 }

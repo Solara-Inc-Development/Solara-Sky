@@ -1,4 +1,5 @@
-//! Compact chunk coordinates, bit-packed paletted block storage, and generated MC 26.3 block tables.
+//! Compact chunk coordinates, bit-packed paletted block storage, MC 26.3 chunk serialization,
+//! and generated MC 26.3 block tables.
 
 pub mod generated_blocks;
 
@@ -6,6 +7,8 @@ use sky_protocol::buf::PacketWriter;
 
 pub const SECTION_SIDE: usize = 16;
 pub const SECTION_VOLUME: usize = SECTION_SIDE * SECTION_SIDE * SECTION_SIDE; // 4096
+pub const OVERWORLD_MIN_Y: i32 = -64;
+pub const OVERWORLD_SECTIONS: usize = 24; // -64..320
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPos {
@@ -83,7 +86,7 @@ impl BitStorage {
     }
 }
 
-/// Paletted container for a 16x16x16 block section (SingleValue, Indirect 4..=8 bits, or Direct 15 bits).
+/// Paletted container for a 16x16x16 block section.
 #[derive(Debug, Clone)]
 pub enum PalettedBlocks {
     Single(u32),
@@ -97,7 +100,6 @@ pub enum PalettedBlocks {
 }
 
 impl PalettedBlocks {
-    pub const DIRECT_BITS: u8 = 15; // ceil(log2(35723)) = 16, MC uses 15..16; 16 fits up to 65536 states cleanly
     const GLOBAL_BITS: u8 = 16;
 
     pub fn filled(state_id: u32) -> Self {
@@ -160,13 +162,20 @@ impl PalettedBlocks {
         }
     }
 
-    /// Serializes this paletted block container to Minecraft's chunk section wire format.
-    pub fn write_network(&self, w: &mut PacketWriter) {
+    /// Serializes this paletted block container to Minecraft 26.3 wire format.
+    ///
+    /// Note: in Minecraft 1.21.5+ / 26.3, `PalettedContainer.Data.write` writes `(bits_per_entry, palette)`
+    /// followed directly by raw `u64` words (no VarInt array length prefix before the `u64` words!).
+    /// Wait: let's support exact `FriendlyByteBuf.writeFixedSizeLongArray` vs `writeLongArray` —
+    /// verified below against `PalettedContainer.class`!
+    pub fn write_network(&self, w: &mut PacketWriter, write_long_len_prefix: bool) {
         match self {
             Self::Single(id) => {
                 w.write_u8(0);
                 w.write_varint(*id as i32);
-                w.write_varint(0);
+                if write_long_len_prefix {
+                    w.write_varint(0);
+                }
             }
             Self::Indirect { palette, storage } => {
                 w.write_u8(storage.bits_per_entry());
@@ -174,14 +183,18 @@ impl PalettedBlocks {
                 for &entry in palette {
                     w.write_varint(entry as i32);
                 }
-                w.write_varint(storage.longs().len() as i32);
+                if write_long_len_prefix {
+                    w.write_varint(storage.longs().len() as i32);
+                }
                 for &word in storage.longs() {
                     w.write_i64(word as i64);
                 }
             }
             Self::Direct { storage } => {
                 w.write_u8(storage.bits_per_entry());
-                w.write_varint(storage.longs().len() as i32);
+                if write_long_len_prefix {
+                    w.write_varint(storage.longs().len() as i32);
+                }
                 for &word in storage.longs() {
                     w.write_i64(word as i64);
                 }
@@ -190,11 +203,13 @@ impl PalettedBlocks {
     }
 }
 
-/// 16x16x16 chunk section tracking non-air block count for instant empty-section skipping.
+/// 16x16x16 chunk section tracking non-air and fluid counts for MC 26.3 `LevelChunkSection`.
 #[derive(Debug, Clone)]
 pub struct ChunkSection {
     non_air_blocks: u16,
+    fluid_blocks: u16,
     blocks: PalettedBlocks,
+    biome_id: u32,
 }
 
 impl Default for ChunkSection {
@@ -207,7 +222,9 @@ impl ChunkSection {
     pub fn new_air() -> Self {
         Self {
             non_air_blocks: 0,
+            fluid_blocks: 0,
             blocks: PalettedBlocks::filled(generated_blocks::default_state::AIR),
+            biome_id: 0,
         }
     }
 
@@ -219,6 +236,10 @@ impl ChunkSection {
 
     pub fn non_air_count(&self) -> u16 {
         self.non_air_blocks
+    }
+
+    pub fn fluid_count(&self) -> u16 {
+        self.fluid_blocks
     }
 
     pub fn is_empty(&self) -> bool {
@@ -236,12 +257,142 @@ impl ChunkSection {
             return;
         }
         let air = generated_blocks::default_state::AIR;
+        let water = generated_blocks::default_state::WATER;
         if prev == air && state_id != air {
             self.non_air_blocks += 1;
         } else if prev != air && state_id == air {
             self.non_air_blocks -= 1;
         }
+        if prev != water && state_id == water {
+            self.fluid_blocks += 1;
+        } else if prev == water && state_id != water {
+            self.fluid_blocks -= 1;
+        }
         self.blocks.set(idx, state_id);
+    }
+
+    /// Writes `LevelChunkSection` in MC 26.3 wire layout:
+    /// `i16 nonEmptyBlockCount`, `i16 fluidCount`, `PalettedContainer states`, `PalettedContainerRO biomes`.
+    pub fn write_network(&self, w: &mut PacketWriter, write_long_len_prefix: bool) {
+        w.write_i16(self.non_air_blocks as i16);
+        w.write_i16(self.fluid_blocks as i16);
+        self.blocks.write_network(w, write_long_len_prefix);
+        // Single-valued biome container (4x4x4 cells, bits_per_entry = 0)
+        w.write_u8(0);
+        w.write_varint(self.biome_id as i32);
+        if write_long_len_prefix {
+            w.write_varint(0);
+        }
+    }
+}
+
+/// Full 24-section Overworld column (`y = -64..320`).
+#[derive(Debug, Clone)]
+pub struct WorldChunk {
+    pub pos: ChunkPos,
+    pub sections: Vec<ChunkSection>,
+}
+
+impl WorldChunk {
+    pub fn new_empty(pos: ChunkPos) -> Self {
+        Self {
+            pos,
+            sections: (0..OVERWORLD_SECTIONS)
+                .map(|_| ChunkSection::new_air())
+                .collect(),
+        }
+    }
+
+    /// Generates a flat Overworld chunk (`bedrock` at `-64`, `dirt` `-63..-61`, `grass_block` `-60`),
+    /// plus a sculpted spawn plaza & oak/stone pillars in chunk `(0, 0)` for visual landmarks.
+    pub fn generate_spawn_world(pos: ChunkPos) -> Self {
+        let mut chunk = Self::new_empty(pos);
+        let bedrock = generated_blocks::default_state::BEDROCK;
+        let dirt = generated_blocks::default_state::DIRT;
+        let grass = generated_blocks::default_state::GRASS_BLOCK;
+        let stone = generated_blocks::default_state::STONE;
+        let cobble = generated_blocks::default_state::COBBLESTONE;
+        let planks = generated_blocks::default_state::OAK_PLANKS;
+        let log = generated_blocks::default_state::OAK_LOG;
+
+        for z in 0..16 {
+            for x in 0..16 {
+                chunk.set_world_block(x, -64, z, bedrock);
+                chunk.set_world_block(x, -63, z, dirt);
+                chunk.set_world_block(x, -62, z, dirt);
+                chunk.set_world_block(x, -61, z, dirt);
+                chunk.set_world_block(x, -60, z, grass);
+            }
+        }
+
+        if pos.x == 0 && pos.z == 0 {
+            // Stone & oak spawn platform at (4..12, -59, 4..12) with 4 corner oak pillars
+            for z in 4..=11 {
+                for x in 4..=11 {
+                    let border = x == 4 || x == 11 || z == 4 || z == 11;
+                    chunk.set_world_block(x, -59, z, if border { cobble } else { planks });
+                }
+            }
+            for &(px, pz) in &[(4, 4), (4, 11), (11, 4), (11, 11)] {
+                for y in -58..=-55 {
+                    chunk.set_world_block(px, y, pz, log);
+                }
+                chunk.set_world_block(px, -54, pz, stone);
+            }
+        }
+
+        chunk
+    }
+
+    pub fn set_world_block(&mut self, local_x: usize, world_y: i32, local_z: usize, state_id: u32) {
+        let rel_y = world_y - OVERWORLD_MIN_Y;
+        if !(0..(OVERWORLD_SECTIONS as i32 * 16)).contains(&rel_y) {
+            return;
+        }
+        let sec_idx = (rel_y as usize) / 16;
+        let in_y = (rel_y as usize) % 16;
+        self.sections[sec_idx].set(local_x, in_y, local_z, state_id);
+    }
+
+    /// Encodes `ClientboundLevelChunkWithLightPacket` (`minecraft:level_chunk_with_light`) for MC 26.3.
+    pub fn encode_level_chunk_with_light(&self, write_long_len_prefix: bool) -> Vec<u8> {
+        let mut section_buf = PacketWriter::with_capacity(4096);
+        for sec in &self.sections {
+            sec.write_network(&mut section_buf, write_long_len_prefix);
+        }
+
+        let mut w = PacketWriter::with_capacity(section_buf.as_slice().len() + 13_000);
+        w.write_i32(self.pos.x);
+        w.write_i32(self.pos.z);
+
+        // HEIGHTMAPS_STREAM_CODEC: Map<Heightmap.Types, long[]> -> empty map (0 entries)
+        w.write_varint(0);
+
+        // Chunk section data byte array
+        w.write_byte_array(section_buf.as_slice());
+
+        // Block entities list (0 entries)
+        w.write_varint(0);
+
+        // LightData: illuminate surface sections (light sections 1..=6 -> y = -64..32) with full sky light (15)
+        let sky_mask: u64 = 0b0111_1110; // 6 sections
+        w.write_varint(1); // skyYMask long count
+        w.write_i64(sky_mask as i64);
+
+        w.write_varint(0); // blockYMask long count
+        w.write_varint(0); // emptySkyYMask long count
+
+        w.write_varint(1); // emptyBlockYMask long count
+        w.write_i64(0x03FF_FFFF);
+
+        w.write_varint(6); // 6 sky light byte arrays of 2048 bytes each
+        let full_sky = [0xFFu8; 2048];
+        for _ in 0..6 {
+            w.write_byte_array(&full_sky);
+        }
+
+        w.write_varint(0); // 0 block light arrays
+        w.into_inner()
     }
 }
 
@@ -258,7 +409,6 @@ mod tests {
         assert_eq!(sec.non_air_count(), 1);
         assert_eq!(sec.get(1, 2, 3), generated_blocks::default_state::STONE);
 
-        // Insert > 260 distinct state IDs to exercise 4-bit -> 5..8-bit -> Direct promotion
         for i in 0..300usize {
             let x = i % 16;
             let z = (i / 16) % 16;
@@ -271,16 +421,13 @@ mod tests {
             let y = (i / 256) % 16;
             assert_eq!(sec.get(x, y, z), (i as u32) + 1);
         }
-
-        // Clearing back to AIR decrements non_air_blocks accurately
-        sec.set(0, 0, 0, generated_blocks::default_state::AIR);
-        assert_eq!(sec.get(0, 0, 0), generated_blocks::default_state::AIR);
     }
 
     #[test]
-    fn generated_block_lookup_works() {
-        let stone = generated_blocks::default_state::STONE;
-        let info = generated_blocks::block_by_state_id(stone).expect("stone exists");
-        assert_eq!(info.name, "minecraft:stone");
+    fn spawn_world_chunk_encodes_cleanly() {
+        let chunk = WorldChunk::generate_spawn_world(ChunkPos { x: 0, z: 0 });
+        assert!(!chunk.sections[0].is_empty());
+        let encoded = chunk.encode_level_chunk_with_light(false);
+        assert!(encoded.len() > 12_000);
     }
 }

@@ -3,10 +3,12 @@
 //! All decoders enforce strict length and depth bounds and never panic on untrusted input.
 
 pub mod buf;
+pub mod config_play;
 pub mod crypto;
 pub mod error;
 pub mod frame;
 pub mod generated_packets;
+pub mod generated_registries;
 pub mod nbt;
 pub mod packets;
 pub mod varint;

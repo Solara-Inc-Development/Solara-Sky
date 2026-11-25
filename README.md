@@ -31,6 +31,10 @@ cargo test --workspace
 cargo run --bin solara-sky
 ```
 
-## License
+## License & Legal Notice
 
 Licensed under the **GNU General Public License v3.0** — see [LICENSE](./LICENSE).
+
+`Solara-Sky` is an independent, clean-room Rust implementation of the Minecraft: Java Edition server protocol and contains zero Mojang code or redistributed game assets.
+
+> **NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.**

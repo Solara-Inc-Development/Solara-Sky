@@ -7750,7 +7750,6 @@ pub static BLOCK_RANGES: &[BlockRange] = &[
     },
 ];
 
-/// Look up the block metadata for any Minecraft numeric block state ID in O(log n).
 pub fn block_by_state_id(state_id: u32) -> Option<&'static BlockRange> {
     let idx = BLOCK_RANGES.partition_point(|r| r.min_state_id <= state_id);
     if idx == 0 {
@@ -7760,7 +7759,6 @@ pub fn block_by_state_id(state_id: u32) -> Option<&'static BlockRange> {
     (state_id <= candidate.max_state_id).then_some(candidate)
 }
 
-/// Look up the default block state ID by resource name (e.g. "minecraft:stone").
 pub fn default_state_by_name(name: &str) -> Option<u32> {
     BLOCK_RANGES
         .iter()
