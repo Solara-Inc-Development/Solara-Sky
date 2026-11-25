@@ -1,4 +1,5 @@
 use crate::config::{ProxyMode, ServerProperties, SkyConfig};
+use crate::world_state::{BroadcastEvent, ConnectedPlayer, LiveWorld};
 use anyhow::{Context, Result, bail};
 use rand::RngCore;
 use rsa::pkcs8::EncodePublicKey;
@@ -7,10 +8,13 @@ use serde::Deserialize;
 use sky_api::{PlayerPreLoginEvent, PluginManager, StatusPingEvent};
 use sky_protocol::buf::{PacketReader, PacketWriter};
 use sky_protocol::config_play::{
-    AcceptTeleportC2s, GAME_EVENT_START_WAITING_CHUNKS, GameMode, KnownPack, PlayLoginS2c,
-    decode_select_known_packs, encode_brand_payload, encode_enabled_features, encode_game_event,
+    AcceptTeleportC2s, GAME_EVENT_CHANGE_GAME_MODE, GAME_EVENT_START_WAITING_CHUNKS, GameMode,
+    KnownPack, PlayLoginS2c, PlayerActionC2s, UseItemOnC2s, decode_chat_command,
+    decode_chat_message, decode_select_known_packs, direction_offset, encode_block_changed_ack,
+    encode_block_update, encode_brand_payload, encode_enabled_features, encode_game_event,
     encode_nbt_disconnect, encode_player_position, encode_registry_data_known,
-    encode_select_known_packs, encode_set_chunk_cache_center, encode_update_tags,
+    encode_select_known_packs, encode_set_chunk_cache_center, encode_system_chat,
+    encode_update_tags,
 };
 use sky_protocol::crypto::{MinecraftCipher, mojang_server_hash};
 use sky_protocol::error::ProtocolError;
@@ -24,8 +28,9 @@ use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
 };
 use sky_protocol::{generated_packets, generated_registries};
-use sky_world::{ChunkPos, WorldChunk};
+use sky_world::generated_blocks;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +38,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Default 9-slot building palette mapped to hotbar slots `0..=8`.
+const HOTBAR_BLOCKS: [u32; 9] = [
+    generated_blocks::default_state::STONE,
+    generated_blocks::default_state::COBBLESTONE,
+    generated_blocks::default_state::OAK_PLANKS,
+    generated_blocks::default_state::OAK_LOG,
+    generated_blocks::default_state::DIRT,
+    generated_blocks::default_state::GRASS_BLOCK,
+    generated_blocks::default_state::SAND,
+    generated_blocks::default_state::GLASS,
+    generated_blocks::default_state::DEEPSLATE,
+];
 
 pub struct SharedServerState {
     pub props: ServerProperties,
@@ -42,12 +60,12 @@ pub struct SharedServerState {
     pub plugins: PluginManager,
     pub online_players: AtomicUsize,
     pub next_entity_id: AtomicI32,
-    /// Pre-serialized `ClientboundLevelChunkWithLightPacket` payloads for the spawn region.
-    pub spawn_chunk_packets: Vec<Vec<u8>>,
+    pub world: LiveWorld,
 }
 
 impl SharedServerState {
     pub fn new(
+        config_dir: &Path,
         props: ServerProperties,
         sky_cfg: SkyConfig,
         plugins: PluginManager,
@@ -73,14 +91,8 @@ impl SharedServerState {
             .context("build HTTP client")?;
 
         let radius = i32::from(props.view_distance.clamp(2, 6));
-        let mut spawn_chunk_packets =
-            Vec::with_capacity(((2 * radius + 1) * (2 * radius + 1)) as usize);
-        for cz in -radius..=radius {
-            for cx in -radius..=radius {
-                let chunk = WorldChunk::generate_spawn_world(ChunkPos { x: cx, z: cz });
-                spawn_chunk_packets.push(chunk.encode_level_chunk_with_light(false));
-            }
-        }
+        let region_dir = config_dir.join("world").join("region");
+        let world = LiveWorld::load_or_generate(region_dir, radius)?;
 
         Ok(Self {
             props,
@@ -90,23 +102,34 @@ impl SharedServerState {
             plugins,
             online_players: AtomicUsize::new(0),
             next_entity_id: AtomicI32::new(1),
-            spawn_chunk_packets,
+            world,
         })
     }
 }
 
-struct OnlinePlayerGuard<'a>(&'a AtomicUsize);
+struct OnlinePlayerGuard<'a> {
+    counter: &'a AtomicUsize,
+    world: &'a LiveWorld,
+    entity_id: i32,
+}
 
 impl<'a> OnlinePlayerGuard<'a> {
-    fn acquire(counter: &'a AtomicUsize) -> Self {
+    fn acquire(counter: &'a AtomicUsize, world: &'a LiveWorld, player: ConnectedPlayer) -> Self {
+        let entity_id = player.entity_id;
         counter.fetch_add(1, Ordering::Relaxed);
-        Self(counter)
+        world.add_player(player);
+        Self {
+            counter,
+            world,
+            entity_id,
+        }
     }
 }
 
 impl Drop for OnlinePlayerGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.world.remove_player(self.entity_id);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -499,7 +522,6 @@ async fn handle_login(
     conn.send_packet(LoginFinishedS2c::PACKET_ID, &finished.encode())
         .await?;
 
-    // Wait for ServerboundLoginAcknowledgedPacket to enter Configuration state
     let Some((ack_id, _)) = conn.read_packet().await? else {
         return Ok(());
     };
@@ -534,9 +556,7 @@ async fn handle_configuration(conn: &mut FramedConnection, username: &str) -> Re
 
     while let Some((pkt_id, payload)) = conn.read_packet().await? {
         match pkt_id {
-            c2s::CLIENT_INFORMATION | c2s::CUSTOM_PAYLOAD | c2s::RESOURCE_PACK => {
-                // Accepted cleanly
-            }
+            c2s::CLIENT_INFORMATION | c2s::CUSTOM_PAYLOAD | c2s::RESOURCE_PACK => {}
             c2s::KEEP_ALIVE | c2s::PONG => {}
             c2s::SELECT_KNOWN_PACKS => {
                 let mut r = PacketReader::new(&payload);
@@ -552,7 +572,6 @@ async fn handle_configuration(conn: &mut FramedConnection, username: &str) -> Re
                     return Ok(false);
                 }
 
-                // Stream all 32 synchronized dynamic registries + 773 vanilla network tags
                 for &(reg_id, entries) in generated_registries::SYNCHRONIZED_REGISTRIES {
                     let reg_bytes = encode_registry_data_known(reg_id, entries);
                     conn.send_packet(s2c::REGISTRY_DATA, &reg_bytes).await?;
@@ -574,6 +593,151 @@ async fn handle_configuration(conn: &mut FramedConnection, username: &str) -> Re
     Ok(false)
 }
 
+async fn send_chat(conn: &mut FramedConnection, text: &str) -> Result<(), ProtocolError> {
+    conn.send_packet(
+        generated_packets::play::clientbound::SYSTEM_CHAT,
+        &encode_system_chat(text, false),
+    )
+    .await
+}
+
+async fn execute_command(
+    cmd_line: &str,
+    conn: &mut FramedConnection,
+    entity_id: i32,
+    player_pos: &mut [f64; 3],
+    game_mode: &mut GameMode,
+    next_tp_id: &mut i32,
+    state: &SharedServerState,
+) -> Result<()> {
+    use generated_packets::play::clientbound as s2c;
+
+    let parts: Vec<&str> = cmd_line
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .collect();
+    let Some(&cmd) = parts.first() else {
+        return Ok(());
+    };
+
+    match cmd.to_ascii_lowercase().as_str() {
+        "help" => {
+            send_chat(
+                conn,
+                "Solara-Sky commands: /help, /list, /gamemode <mode>, /tp <x> <y> <z>, /setblock <x> <y> <z> <block>, /save",
+            )
+            .await?;
+        }
+        "list" => {
+            let names = state.world.online_usernames();
+            send_chat(
+                conn,
+                &format!(
+                    "Online ({}/{}): {}",
+                    names.len(),
+                    state.props.max_players,
+                    names.join(", ")
+                ),
+            )
+            .await?;
+        }
+        "gamemode" | "gm" => {
+            let Some(&arg) = parts.get(1) else {
+                send_chat(
+                    conn,
+                    "Usage: /gamemode <survival|creative|adventure|spectator>",
+                )
+                .await?;
+                return Ok(());
+            };
+            let new_mode = GameMode::from_name(arg);
+            *game_mode = new_mode;
+            state.world.update_player_gamemode(entity_id, new_mode);
+            conn.send_packet(
+                s2c::GAME_EVENT,
+                &encode_game_event(GAME_EVENT_CHANGE_GAME_MODE, (new_mode as u8) as f32),
+            )
+            .await?;
+            send_chat(conn, &format!("Set game mode to {new_mode:?}.")).await?;
+        }
+        "tp" => {
+            if parts.len() < 4 {
+                send_chat(conn, "Usage: /tp <x> <y> <z>").await?;
+                return Ok(());
+            }
+            if let (Ok(x), Ok(y), Ok(z)) = (
+                parts[1].parse::<f64>(),
+                parts[2].parse::<f64>(),
+                parts[3].parse::<f64>(),
+            ) {
+                *player_pos = [x, y, z];
+                state.world.update_player_pos(entity_id, *player_pos);
+                *next_tp_id += 1;
+                conn.send_packet(
+                    s2c::PLAYER_POSITION,
+                    &encode_player_position(*next_tp_id, *player_pos, 0.0, 0.0),
+                )
+                .await?;
+                send_chat(conn, &format!("Teleported to ({x:.1}, {y:.1}, {z:.1}).")).await?;
+            } else {
+                send_chat(conn, "Invalid coordinates for /tp.").await?;
+            }
+        }
+        "setblock" => {
+            if parts.len() < 5 {
+                send_chat(conn, "Usage: /setblock <x> <y> <z> <block>").await?;
+                return Ok(());
+            }
+            if let (Ok(x), Ok(y), Ok(z)) = (
+                parts[1].parse::<i32>(),
+                parts[2].parse::<i32>(),
+                parts[3].parse::<i32>(),
+            ) {
+                let raw_name = parts[4];
+                let full_name = if raw_name.contains(':') {
+                    raw_name.to_owned()
+                } else {
+                    format!("minecraft:{raw_name}")
+                };
+                if let Some(st) = generated_blocks::default_state_by_name(&full_name) {
+                    if state.world.set_block(x, y, z, st) {
+                        state
+                            .world
+                            .broadcast_packet(s2c::BLOCK_UPDATE, encode_block_update(x, y, z, st));
+                        send_chat(conn, &format!("Placed {full_name} at ({x}, {y}, {z}).")).await?;
+                    } else {
+                        send_chat(conn, "Y coordinate must be within -64..319.").await?;
+                    }
+                } else {
+                    send_chat(conn, &format!("Unknown block '{full_name}'.")).await?;
+                }
+            }
+        }
+        "save" => match state.world.save_dirty_chunks(true).await {
+            Ok(saved) => {
+                send_chat(
+                    conn,
+                    &format!("Saved {saved} chunks to Anvil .mca region files."),
+                )
+                .await?;
+            }
+            Err(err) => {
+                warn!(error = %err, "Anvil save command failed");
+                send_chat(conn, "World save failed — check server logs.").await?;
+            }
+        },
+        other => {
+            send_chat(
+                conn,
+                &format!("Unknown command '/{other}'. Type /help for commands."),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_play(
     conn: &mut FramedConnection,
     username: &str,
@@ -582,10 +746,23 @@ async fn handle_play(
 ) -> Result<()> {
     use generated_packets::play::{clientbound as s2c, serverbound as c2s};
 
-    let _online_guard = OnlinePlayerGuard::acquire(&state.online_players);
     let entity_id = state.next_entity_id.fetch_add(1, Ordering::Relaxed);
+    let mut game_mode = GameMode::from_name(&state.props.gamemode);
+    let spawn_pos = [8.0, -58.0, 8.0];
 
-    // Determine index of "minecraft:overworld" inside synchronized dimension_type registry
+    let mut broadcast_rx = state.world.subscribe();
+    let _online_guard = OnlinePlayerGuard::acquire(
+        &state.online_players,
+        &state.world,
+        ConnectedPlayer {
+            entity_id,
+            username: username.to_owned(),
+            uuid,
+            position: spawn_pos,
+            game_mode,
+        },
+    );
+
     let overworld_dim_id = generated_registries::SYNCHRONIZED_REGISTRIES
         .iter()
         .find(|&&(reg, _)| reg == "minecraft:dimension_type")
@@ -606,7 +783,7 @@ async fn handle_play(
         dimension_type_id: overworld_dim_id,
         dimension_name: "minecraft:overworld".into(),
         hashed_seed: 0x501A_2A26_3000_0777,
-        game_mode: GameMode::from_name(&state.props.gamemode),
+        game_mode,
         is_debug: false,
         is_flat: true,
         portal_cooldown: 0,
@@ -627,15 +804,27 @@ async fn handle_play(
     )
     .await?;
 
-    for chunk_bytes in &state.spawn_chunk_packets {
+    let chunk_packets = state.world.serialize_spawn_chunks();
+    let chunk_count = chunk_packets.len();
+    for chunk_bytes in &chunk_packets {
         conn.send_packet(s2c::LEVEL_CHUNK_WITH_LIGHT, chunk_bytes)
             .await?;
     }
 
-    let spawn_pos = [8.0, -58.0, 8.0];
+    let mut next_tp_id = 1i32;
     conn.send_packet(
         s2c::PLAYER_POSITION,
-        &encode_player_position(1, spawn_pos, 0.0, 0.0),
+        &encode_player_position(next_tp_id, spawn_pos, 0.0, 0.0),
+    )
+    .await?;
+
+    state.world.broadcast_packet(
+        s2c::SYSTEM_CHAT,
+        encode_system_chat(&format!("{username} joined the game"), false),
+    );
+    send_chat(
+        conn,
+        "Welcome to Solara-Sky (MC 26.3)! Hotbar 1-9 selects blocks; type /help for commands.",
     )
     .await?;
 
@@ -643,14 +832,14 @@ async fn handle_play(
         %username,
         %uuid,
         entity_id,
-        chunks = state.spawn_chunk_packets.len(),
+        chunks = chunk_count,
         "player spawned in Solara-Sky world"
     );
 
     let mut keep_alive_tick = tokio::time::interval(Duration::from_secs(10));
-    // Consume immediate first tick
     keep_alive_tick.tick().await;
     let mut player_pos = spawn_pos;
+    let mut held_slot: usize = 0;
 
     loop {
         tokio::select! {
@@ -663,9 +852,18 @@ async fn handle_play(
                 w.write_i64(id);
                 conn.send_packet(s2c::KEEP_ALIVE, w.as_slice()).await?;
             }
+            bcast = broadcast_rx.recv() => {
+                if let Ok(BroadcastEvent::Packet { packet_id, payload }) = bcast {
+                    conn.send_packet(packet_id, &payload).await?;
+                }
+            }
             pkt_res = conn.read_packet() => {
                 let Some((pkt_id, payload)) = pkt_res? else {
                     info!(%username, "player disconnected cleanly");
+                    state.world.broadcast_packet(
+                        s2c::SYSTEM_CHAT,
+                        encode_system_chat(&format!("{username} left the game"), false),
+                    );
                     return Ok(());
                 };
                 match pkt_id {
@@ -673,14 +871,93 @@ async fn handle_play(
                         let mut r = PacketReader::new(&payload);
                         let ack = AcceptTeleportC2s::decode(&mut r)?;
                         player_pos = [ack.x, ack.y, ack.z];
+                        state.world.update_player_pos(entity_id, player_pos);
                     }
-                    c2s::MOVE_PLAYER_POS => {
+                    c2s::MOVE_PLAYER_POS | c2s::MOVE_PLAYER_POS_ROT => {
                         let mut r = PacketReader::new(&payload);
                         player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+                        state.world.update_player_pos(entity_id, player_pos);
                     }
-                    c2s::MOVE_PLAYER_POS_ROT => {
+                    c2s::SET_CARRIED_ITEM => {
                         let mut r = PacketReader::new(&payload);
-                        player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+                        let slot = usize::from(r.read_u16()?);
+                        if slot < HOTBAR_BLOCKS.len() {
+                            held_slot = slot;
+                        }
+                    }
+                    c2s::PLAYER_ACTION => {
+                        let mut r = PacketReader::new(&payload);
+                        let act = PlayerActionC2s::decode(&mut r)?;
+                        let instant_break = game_mode == GameMode::Creative
+                            && act.action == PlayerActionC2s::START_DESTROY_BLOCK;
+                        let finished_break = act.action == PlayerActionC2s::STOP_DESTROY_BLOCK;
+                        if instant_break || finished_break {
+                            let (bx, by, bz) = act.pos;
+                            let air = generated_blocks::default_state::AIR;
+                            if state.world.set_block(bx, by, bz, air) {
+                                state.world.broadcast_packet(
+                                    s2c::BLOCK_UPDATE,
+                                    encode_block_update(bx, by, bz, air),
+                                );
+                            }
+                        }
+                        conn.send_packet(
+                            s2c::BLOCK_CHANGED_ACK,
+                            &encode_block_changed_ack(act.sequence),
+                        )
+                        .await?;
+                    }
+                    c2s::USE_ITEM_ON => {
+                        let mut r = PacketReader::new(&payload);
+                        let use_pkt = UseItemOnC2s::decode(&mut r)?;
+                        if use_pkt.hand == 0 {
+                            let (dx, dy, dz) = direction_offset(use_pkt.direction);
+                            let (tx, ty, tz) = (
+                                use_pkt.pos.0 + dx,
+                                use_pkt.pos.1 + dy,
+                                use_pkt.pos.2 + dz,
+                            );
+                            let placed_state = HOTBAR_BLOCKS[held_slot];
+                            if state.world.get_block(tx, ty, tz) == generated_blocks::default_state::AIR
+                                && state.world.set_block(tx, ty, tz, placed_state)
+                            {
+                                state.world.broadcast_packet(
+                                    s2c::BLOCK_UPDATE,
+                                    encode_block_update(tx, ty, tz, placed_state),
+                                );
+                            }
+                        }
+                        conn.send_packet(
+                            s2c::BLOCK_CHANGED_ACK,
+                            &encode_block_changed_ack(use_pkt.sequence),
+                        )
+                        .await?;
+                    }
+                    c2s::CHAT => {
+                        let mut r = PacketReader::new(&payload);
+                        let msg = decode_chat_message(&mut r)?;
+                        if !msg.trim().is_empty() {
+                            info!(%username, message = %msg, "chat");
+                            state.world.broadcast_packet(
+                                s2c::SYSTEM_CHAT,
+                                encode_system_chat(&format!("<{username}> {msg}"), false),
+                            );
+                        }
+                    }
+                    c2s::CHAT_COMMAND => {
+                        let mut r = PacketReader::new(&payload);
+                        let cmd = decode_chat_command(&mut r)?;
+                        info!(%username, command = %cmd, "command");
+                        execute_command(
+                            &cmd,
+                            conn,
+                            entity_id,
+                            &mut player_pos,
+                            &mut game_mode,
+                            &mut next_tp_id,
+                            state,
+                        )
+                        .await?;
                     }
                     c2s::KEEP_ALIVE
                     | c2s::MOVE_PLAYER_ROT
@@ -691,7 +968,7 @@ async fn handle_play(
                     | c2s::CLIENT_INFORMATION
                     | c2s::CUSTOM_PAYLOAD => {}
                     other => {
-                        debug!(%username, pkt_id = other, pos = ?player_pos, "ignoring unhandled Play packet");
+                        debug!(%username, pkt_id = other, "ignoring unhandled Play packet");
                     }
                 }
             }

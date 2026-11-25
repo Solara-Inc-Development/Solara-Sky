@@ -184,6 +184,7 @@ impl PlayLoginS2c {
     }
 }
 
+pub const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
 pub const GAME_EVENT_START_WAITING_CHUNKS: u8 = 13;
 
 pub fn encode_game_event(event: u8, param: f32) -> Vec<u8> {
@@ -245,6 +246,112 @@ impl AcceptTeleportC2s {
             pitch: r.read_f32()?,
         })
     }
+}
+
+/// Encodes `ClientboundSystemChatPacket` (`minecraft:system_chat`: Network NBT Component + `bool overlay`).
+pub fn encode_system_chat(message: &str, overlay: bool) -> Vec<u8> {
+    let tag = NbtTag::Compound(vec![("text".into(), NbtTag::String(message.to_owned()))]);
+    let mut w = PacketWriter::with_capacity(16 + message.len());
+    write_network_nbt(&mut w, &tag);
+    w.write_bool(overlay);
+    w.into_inner()
+}
+
+/// Encodes `ClientboundBlockUpdatePacket` (`minecraft:block_update`: `BlockPos` + `VarInt state_id`).
+pub fn encode_block_update(x: i32, y: i32, z: i32, state_id: u32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(14);
+    w.write_block_pos(x, y, z);
+    w.write_varint(state_id as i32);
+    w.into_inner()
+}
+
+/// Encodes `ClientboundBlockChangedAckPacket` (`minecraft:block_changed_ack`).
+pub fn encode_block_changed_ack(sequence: i32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(5);
+    w.write_varint(sequence);
+    w.into_inner()
+}
+
+/// Returns the `(dx, dy, dz)` offset for a Minecraft `Direction` enum (`0=Down, 1=Up, 2=North, 3=South, 4=West, 5=East`).
+pub const fn direction_offset(direction: i32) -> (i32, i32, i32) {
+    match direction {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Decodes `ServerboundPlayerActionPacket` (`action: VarInt, pos: BlockPos, direction: u8, sequence: VarInt`).
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerActionC2s {
+    pub action: i32,
+    pub pos: (i32, i32, i32),
+    pub direction: u8,
+    pub sequence: i32,
+}
+
+impl PlayerActionC2s {
+    pub const START_DESTROY_BLOCK: i32 = 0;
+    pub const ABORT_DESTROY_BLOCK: i32 = 1;
+    pub const STOP_DESTROY_BLOCK: i32 = 2;
+
+    pub fn decode(r: &mut PacketReader<'_>) -> ProtocolResult<Self> {
+        Ok(Self {
+            action: r.read_varint()?,
+            pos: r.read_block_pos()?,
+            direction: r.read_u8()?,
+            sequence: r.read_varint()?,
+        })
+    }
+}
+
+/// Decodes `ServerboundUseItemOnPacket` (`hand, BlockHitResult, sequence`).
+#[derive(Debug, Clone, Copy)]
+pub struct UseItemOnC2s {
+    pub hand: i32,
+    pub pos: (i32, i32, i32),
+    pub direction: i32,
+    pub cursor: [f32; 3],
+    pub inside: bool,
+    pub world_border_hit: bool,
+    pub sequence: i32,
+}
+
+impl UseItemOnC2s {
+    pub fn decode(r: &mut PacketReader<'_>) -> ProtocolResult<Self> {
+        let hand = r.read_varint()?;
+        let pos = r.read_block_pos()?;
+        let direction = r.read_varint()?;
+        let cx = r.read_f32()?;
+        let cy = r.read_f32()?;
+        let cz = r.read_f32()?;
+        let inside = r.read_bool()?;
+        let world_border_hit = r.read_bool()?;
+        let sequence = r.read_varint()?;
+        Ok(Self {
+            hand,
+            pos,
+            direction,
+            cursor: [cx, cy, cz],
+            inside,
+            world_border_hit,
+            sequence,
+        })
+    }
+}
+
+/// Decodes `ServerboundChatPacket` (extracting the 256-char UTF-8 chat text cleanly).
+pub fn decode_chat_message(r: &mut PacketReader<'_>) -> ProtocolResult<String> {
+    r.read_string(256)
+}
+
+/// Decodes `ServerboundChatCommandPacket`.
+pub fn decode_chat_command(r: &mut PacketReader<'_>) -> ProtocolResult<String> {
+    r.read_string(256)
 }
 
 #[cfg(test)]

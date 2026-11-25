@@ -1436,7 +1436,9 @@ dependencies = [
 name = "sky-world"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "flate2",
  "sky-protocol",
+ "thiserror",
 ]
 
 [[package]]

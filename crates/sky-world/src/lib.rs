@@ -1,6 +1,7 @@
 //! Compact chunk coordinates, bit-packed paletted block storage, MC 26.3 chunk serialization,
 //! and generated MC 26.3 block tables.
 
+pub mod anvil;
 pub mod generated_blocks;
 
 use sky_protocol::buf::PacketWriter;
@@ -352,6 +353,16 @@ impl WorldChunk {
         let sec_idx = (rel_y as usize) / 16;
         let in_y = (rel_y as usize) % 16;
         self.sections[sec_idx].set(local_x, in_y, local_z, state_id);
+    }
+
+    pub fn get_world_block(&self, local_x: usize, world_y: i32, local_z: usize) -> u32 {
+        let rel_y = world_y - OVERWORLD_MIN_Y;
+        if !(0..(OVERWORLD_SECTIONS as i32 * 16)).contains(&rel_y) {
+            return generated_blocks::default_state::AIR;
+        }
+        let sec_idx = (rel_y as usize) / 16;
+        let in_y = (rel_y as usize) % 16;
+        self.sections[sec_idx].get(local_x, in_y, local_z)
     }
 
     /// Encodes `ClientboundLevelChunkWithLightPacket` (`minecraft:level_chunk_with_light`) for MC 26.3.

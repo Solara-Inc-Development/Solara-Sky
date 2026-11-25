@@ -1,5 +1,6 @@
 pub mod config;
 pub mod net;
+pub mod world_state;
 
 use crate::config::{ServerProperties, SkyConfig};
 use crate::net::{SharedServerState, handle_client};
@@ -17,7 +18,7 @@ use tracing::{info, warn};
     about = "High-performance Rust Minecraft: Java Edition 26.3 server"
 )]
 struct Cli {
-    /// Directory containing server.properties and solara-sky.toml
+    /// Directory containing server.properties, solara-sky.toml, and world/region/
     #[arg(long, default_value = ".")]
     config_dir: PathBuf,
 
@@ -61,7 +62,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind TCP listener on {bind_addr}"))?;
 
     let plugins = PluginManager::new();
-    let shared = Arc::new(SharedServerState::new(props, sky_cfg, plugins)?);
+    let shared = Arc::new(SharedServerState::new(
+        &cli.config_dir,
+        props,
+        sky_cfg,
+        plugins,
+    )?);
     info!(address = %bind_addr, "Solara-Sky is listening for Minecraft 26.3 connections");
 
     loop {
@@ -80,7 +86,11 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("received shutdown signal, stopping Solara-Sky cleanly");
+                info!("received shutdown signal, saving modified chunks to Anvil .mca...");
+                match shared.world.save_dirty_chunks(false).await {
+                    Ok(saved) => info!(saved_chunks = saved, "Anvil world save complete"),
+                    Err(err) => warn!(error = %err, "failed to save dirty Anvil chunks on shutdown"),
+                }
                 shared.plugins.shutdown();
                 break;
             }

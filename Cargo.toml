@@ -12,7 +12,7 @@ members = [
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "GPL-3.0-only"
-repository = "https://github.com/solara-akksh/Solara-Sky"
+repository = "https://github.com/Solara-Inc-Development/Solara-Sky"
 rust-version = "1.85"
 
 [workspace.dependencies]
