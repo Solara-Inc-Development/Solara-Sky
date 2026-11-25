@@ -1,11 +1,16 @@
+use crate::admin::AccessControl;
 use crate::config::{ProxyMode, ServerProperties, SkyConfig};
+use crate::tick::TickProfiler;
 use crate::world_state::{BroadcastEvent, ConnectedPlayer, LiveWorld, WORLD_SEED};
 use anyhow::{Context, Result, bail};
 use rand::RngCore;
 use rsa::pkcs8::EncodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey};
 use serde::Deserialize;
-use sky_api::{PlayerPreLoginEvent, PluginManager, StatusPingEvent};
+use sky_api::{
+    BlockChangeEvent, BlockChangeKind, ChatEvent, CommandEvent, PlayerPreLoginEvent, PluginManager,
+    StatusPingEvent,
+};
 use sky_protocol::buf::{PacketReader, PacketWriter};
 use sky_protocol::config_play::{
     AcceptTeleportC2s, GAME_EVENT_CHANGE_GAME_MODE, GAME_EVENT_START_WAITING_CHUNKS, GameMode,
@@ -38,7 +43,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -62,6 +67,8 @@ pub struct SharedServerState {
     pub rsa_key: Option<(RsaPrivateKey, Vec<u8>)>,
     pub http: reqwest::Client,
     pub plugins: PluginManager,
+    pub acl: AccessControl,
+    pub profiler: TickProfiler,
     pub online_players: AtomicUsize,
     pub next_entity_id: AtomicI32,
     pub world: LiveWorld,
@@ -94,6 +101,8 @@ impl SharedServerState {
             .build()
             .context("build HTTP client")?;
 
+        let acl = AccessControl::load_or_create(config_dir)?;
+        let profiler = TickProfiler::new(sky_cfg.performance.target_tps);
         let radius = i32::from(props.view_distance.clamp(2, 16));
         let region_dir = config_dir.join("world").join("region");
         let world = LiveWorld::load_or_generate(region_dir, radius.min(6))?;
@@ -104,6 +113,8 @@ impl SharedServerState {
             rsa_key,
             http,
             plugins,
+            acl,
+            profiler,
             online_players: AtomicUsize::new(0),
             next_entity_id: AtomicI32::new(1),
             world,
@@ -155,14 +166,22 @@ struct FramedConnection {
     stream: TcpStream,
     cipher: Option<MinecraftCipher>,
     compression_threshold: Option<usize>,
+    max_packet_bytes: usize,
+    rate_limit_per_sec: u32,
+    rate_window_start: Instant,
+    packets_in_window: u32,
 }
 
 impl FramedConnection {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, max_packet_bytes: usize, rate_limit_per_sec: u32) -> Self {
         Self {
             stream,
             cipher: None,
             compression_threshold: None,
+            max_packet_bytes: max_packet_bytes.clamp(4096, MAX_WIRE_FRAME_BYTES),
+            rate_limit_per_sec,
+            rate_window_start: Instant::now(),
+            packets_in_window: 0,
         }
     }
 
@@ -217,11 +236,26 @@ impl FramedConnection {
             return Err(ProtocolError::NegativeLength(frame_len_i32));
         }
         let frame_len = frame_len_i32 as usize;
-        if frame_len > MAX_WIRE_FRAME_BYTES {
+        if frame_len > self.max_packet_bytes {
             return Err(ProtocolError::PacketTooLarge {
                 len: frame_len,
-                max: MAX_WIRE_FRAME_BYTES,
+                max: self.max_packet_bytes,
             });
+        }
+
+        if self.rate_limit_per_sec > 0 {
+            let now = Instant::now();
+            if now.duration_since(self.rate_window_start) >= Duration::from_secs(1) {
+                self.rate_window_start = now;
+                self.packets_in_window = 0;
+            }
+            self.packets_in_window += 1;
+            if self.packets_in_window > self.rate_limit_per_sec {
+                return Err(ProtocolError::PacketTooLarge {
+                    len: self.packets_in_window as usize,
+                    max: self.rate_limit_per_sec as usize,
+                });
+            }
         }
 
         let mut body = vec![0u8; frame_len];
@@ -258,7 +292,11 @@ pub async fn handle_client(
     state: Arc<SharedServerState>,
 ) -> Result<()> {
     let _ = stream.set_nodelay(true);
-    let mut conn = FramedConnection::new(stream);
+    let mut conn = FramedConnection::new(
+        stream,
+        state.sky_cfg.performance.max_packet_bytes,
+        state.sky_cfg.performance.packet_rate_limit_per_sec,
+    );
 
     let Some((pkt_id, payload)) = conn.read_packet().await? else {
         return Ok(());
@@ -519,6 +557,15 @@ async fn handle_login(
         conn.set_compression(state.props.network_compression_threshold);
     }
 
+    if let Some(ban_msg) = state.acl.ban_reason(&username, uuid) {
+        send_login_disconnect(conn, format!("You are banned from this server: {ban_msg}")).await?;
+        return Ok(());
+    }
+    if state.props.white_list && !state.acl.is_whitelisted(&username, uuid) {
+        send_login_disconnect(conn, "You are not white-listed on this server!").await?;
+        return Ok(());
+    }
+
     let mut pre_login = PlayerPreLoginEvent {
         username: username.clone(),
         uuid,
@@ -652,9 +699,12 @@ async fn stream_missing_chunks(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_command(
     cmd_line: &str,
     conn: &mut FramedConnection,
+    sender_username: &str,
+    sender_uuid: Uuid,
     entity_id: i32,
     player_pos: &mut [f64; 3],
     game_mode: &mut GameMode,
@@ -671,14 +721,70 @@ async fn execute_command(
     let Some(&cmd) = parts.first() else {
         return Ok(());
     };
+    let lower_cmd = cmd.to_ascii_lowercase();
+    let is_op =
+        state.acl.is_op(sender_username) || (!state.props.online_mode && !state.acl.has_any_ops());
 
-    match cmd.to_ascii_lowercase().as_str() {
+    // 1. Give registered SkyPlugins first chance to handle or extend commands!
+    let mut plugin_cmd = CommandEvent {
+        sender_username: sender_username.to_owned(),
+        sender_uuid,
+        is_op,
+        command: lower_cmd.clone(),
+        args: parts[1..].iter().map(|&s| s.to_owned()).collect(),
+        response_lines: Vec::new(),
+        handled: false,
+    };
+    state.plugins.fire_command(&mut plugin_cmd);
+    for line in &plugin_cmd.response_lines {
+        send_chat(conn, line).await?;
+    }
+    if plugin_cmd.handled {
+        return Ok(());
+    }
+
+    match lower_cmd.as_str() {
         "help" => {
             send_chat(
                 conn,
-                "Solara-Sky commands: /help, /list, /gamemode <mode>, /tp <x> <y> <z>, /setblock <x> <y> <z> <block>, /save",
+                "Solara-Sky commands: /help, /list, /tps, /plugins, /seed, /gamemode, /tp, /setblock, /save, /op, /deop, /kick, /ban, /pardon, /whitelist",
             )
             .await?;
+        }
+        "tps" | "mspt" => {
+            let r = state.profiler.snapshot();
+            send_chat(
+                conn,
+                &format!(
+                    "Solara-Sky TPS (5s/1m): {:.1}/{:.1} | MSPT (last/avg/p95): {:.2}/{:.2}/{:.2} ms | FoliaRegions: {} | Chunks: {} | Cores: {} | Tick: #{}",
+                    r.tps_5s,
+                    r.tps_1m,
+                    r.last_mspt,
+                    r.avg_mspt_5s,
+                    r.p95_mspt_5s,
+                    r.active_regions,
+                    r.loaded_chunks,
+                    r.worker_threads,
+                    r.tick_number
+                ),
+            )
+            .await?;
+        }
+        "plugins" | "pl" => {
+            let metas = state.plugins.plugin_metas();
+            let summary = if metas.is_empty() {
+                "none".to_owned()
+            } else {
+                metas
+                    .iter()
+                    .map(|m| format!("{} v{}", m.name, m.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            send_chat(conn, &format!("Plugins ({}): {summary}", metas.len())).await?;
+        }
+        "seed" => {
+            send_chat(conn, &format!("Seed: [{WORLD_SEED}]")).await?;
         }
         "list" => {
             let names = state.world.online_usernames();
@@ -692,6 +798,117 @@ async fn execute_command(
                 ),
             )
             .await?;
+        }
+        "op" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            let Some(&target) = parts.get(1) else {
+                send_chat(conn, "Usage: /op <player>").await?;
+                return Ok(());
+            };
+            let uid = state
+                .world
+                .find_online_player(target)
+                .map_or_else(|| offline_player_uuid(target), |p| p.uuid);
+            state.acl.grant_op(target, uid)?;
+            send_chat(conn, &format!("Made {target} a server operator.")).await?;
+        }
+        "deop" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            let Some(&target) = parts.get(1) else {
+                send_chat(conn, "Usage: /deop <player>").await?;
+                return Ok(());
+            };
+            if state.acl.revoke_op(target)? {
+                send_chat(conn, &format!("Made {target} no longer a server operator.")).await?;
+            } else {
+                send_chat(conn, &format!("{target} is not an operator.")).await?;
+            }
+        }
+        "kick" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            let Some(&target) = parts.get(1) else {
+                send_chat(conn, "Usage: /kick <player> [reason]").await?;
+                return Ok(());
+            };
+            let reason = if parts.len() > 2 {
+                parts[2..].join(" ")
+            } else {
+                "Kicked by an operator.".to_owned()
+            };
+            state.world.kick_player(target, &reason);
+            send_chat(conn, &format!("Kicked {target}: {reason}")).await?;
+        }
+        "ban" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            let Some(&target) = parts.get(1) else {
+                send_chat(conn, "Usage: /ban <player> [reason]").await?;
+                return Ok(());
+            };
+            let reason = if parts.len() > 2 {
+                parts[2..].join(" ")
+            } else {
+                "Banned by an operator.".to_owned()
+            };
+            let uid = state
+                .world
+                .find_online_player(target)
+                .map_or_else(|| offline_player_uuid(target), |p| p.uuid);
+            state.acl.ban_player(target, uid, &reason)?;
+            state.world.kick_player(target, format!("Banned: {reason}"));
+            send_chat(conn, &format!("Banned {target}: {reason}")).await?;
+        }
+        "pardon" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            let Some(&target) = parts.get(1) else {
+                send_chat(conn, "Usage: /pardon <player>").await?;
+                return Ok(());
+            };
+            if state.acl.pardon_player(target)? {
+                send_chat(conn, &format!("Unbanned {target}.")).await?;
+            } else {
+                send_chat(conn, &format!("{target} was not banned.")).await?;
+            }
+        }
+        "whitelist" => {
+            if !is_op {
+                send_chat(conn, "You do not have operator permission.").await?;
+                return Ok(());
+            }
+            if parts.len() < 3 {
+                send_chat(conn, "Usage: /whitelist <add|remove> <player>").await?;
+                return Ok(());
+            }
+            let target = parts[2];
+            match parts[1].to_ascii_lowercase().as_str() {
+                "add" => {
+                    let uid = state
+                        .world
+                        .find_online_player(target)
+                        .map_or_else(|| offline_player_uuid(target), |p| p.uuid);
+                    state.acl.add_whitelist(target, uid)?;
+                    send_chat(conn, &format!("Added {target} to the whitelist.")).await?;
+                }
+                "remove" => {
+                    state.acl.remove_whitelist(target)?;
+                    send_chat(conn, &format!("Removed {target} from the whitelist.")).await?;
+                }
+                _ => send_chat(conn, "Usage: /whitelist <add|remove> <player>").await?,
+            }
         }
         "gamemode" | "gm" => {
             let Some(&arg) = parts.get(1) else {
@@ -969,10 +1186,19 @@ async fn handle_play(
                 conn.send_packet(s2c::KEEP_ALIVE, w.as_slice()).await?;
             }
             bcast = broadcast_rx.recv() => {
-                if let Ok(BroadcastEvent::Packet { exclude_entity_id, packet_id, payload }) = bcast
-                    && exclude_entity_id != Some(entity_id)
-                {
-                    conn.send_packet(packet_id, &payload).await?;
+                match bcast {
+                    Ok(BroadcastEvent::Packet { exclude_entity_id, packet_id, payload })
+                        if exclude_entity_id != Some(entity_id) =>
+                    {
+                        conn.send_packet(packet_id, &payload).await?;
+                    }
+                    Ok(BroadcastEvent::Kick { target_username_lower, reason })
+                        if target_username_lower == username.to_ascii_lowercase() =>
+                    {
+                        conn.send_packet(s2c::DISCONNECT, &encode_nbt_disconnect(&reason)).await?;
+                        return Ok(());
+                    }
+                    _ => {}
                 }
             }
             pkt_res = conn.read_packet() => {
@@ -1061,7 +1287,16 @@ async fn handle_play(
                         if instant_break || finished_break {
                             let (bx, by, bz) = act.pos;
                             let air = generated_blocks::default_state::AIR;
-                            if state.world.set_block(bx, by, bz, air) {
+                            let mut bev = BlockChangeEvent {
+                                player_username: username.to_owned(),
+                                player_uuid: uuid,
+                                pos: (bx, by, bz),
+                                kind: BlockChangeKind::Break,
+                                new_state_id: air,
+                                cancelled: false,
+                            };
+                            state.plugins.fire_block_change(&mut bev);
+                            if !bev.cancelled && state.world.set_block(bx, by, bz, air) {
                                 state.world.broadcast_all(
                                     s2c::BLOCK_UPDATE,
                                     encode_block_update(bx, by, bz, air),
@@ -1085,7 +1320,18 @@ async fn handle_play(
                                 use_pkt.pos.2 + dz,
                             );
                             let placed_state = HOTBAR_BLOCKS[held_slot];
-                            if state.world.get_block(tx, ty, tz) == generated_blocks::default_state::AIR
+                            let mut bev = BlockChangeEvent {
+                                player_username: username.to_owned(),
+                                player_uuid: uuid,
+                                pos: (tx, ty, tz),
+                                kind: BlockChangeKind::Place,
+                                new_state_id: placed_state,
+                                cancelled: false,
+                            };
+                            state.plugins.fire_block_change(&mut bev);
+                            if !bev.cancelled
+                                && state.world.get_block(tx, ty, tz)
+                                    == generated_blocks::default_state::AIR
                                 && state.world.set_block(tx, ty, tz, placed_state)
                             {
                                 state.world.broadcast_all(
@@ -1104,11 +1350,23 @@ async fn handle_play(
                         let mut r = PacketReader::new(&payload);
                         let msg = decode_chat_message(&mut r)?;
                         if !msg.trim().is_empty() {
-                            info!(%username, message = %msg, "chat");
-                            state.world.broadcast_all(
-                                s2c::SYSTEM_CHAT,
-                                encode_system_chat(&format!("<{username}> {msg}"), false),
-                            );
+                            let mut cev = ChatEvent {
+                                sender_username: username.to_owned(),
+                                sender_uuid: uuid,
+                                message: msg,
+                                cancelled: false,
+                            };
+                            state.plugins.fire_chat(&mut cev);
+                            if !cev.cancelled {
+                                info!(%username, message = %cev.message, "chat");
+                                state.world.broadcast_all(
+                                    s2c::SYSTEM_CHAT,
+                                    encode_system_chat(
+                                        &format!("<{username}> {}", cev.message),
+                                        false,
+                                    ),
+                                );
+                            }
                         }
                     }
                     c2s::CHAT_COMMAND => {
@@ -1118,6 +1376,8 @@ async fn handle_play(
                         execute_command(
                             &cmd,
                             conn,
+                            username,
+                            uuid,
                             entity_id,
                             &mut player_pos,
                             &mut game_mode,

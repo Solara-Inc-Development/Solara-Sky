@@ -1,16 +1,44 @@
+pub mod admin;
 pub mod config;
 pub mod net;
+pub mod tick;
 pub mod world_state;
 
 use crate::config::{ServerProperties, SkyConfig};
 use crate::net::{SharedServerState, handle_client};
 use anyhow::{Context, Result};
 use clap::Parser;
-use sky_api::PluginManager;
+use sky_api::{CommandEvent, PluginManager, PluginMeta, ServerInfo, SkyPlugin};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+
+/// Built-in core telemetry & server info plugin exercising `sky-api` with zero overhead.
+struct SolaraCorePlugin;
+
+impl SkyPlugin for SolaraCorePlugin {
+    fn meta(&self) -> PluginMeta {
+        PluginMeta {
+            id: "solara-core".into(),
+            name: "SolaraCore".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            authors: vec!["Solara-Inc-Development".into()],
+        }
+    }
+
+    fn on_command(&self, event: &mut CommandEvent) {
+        if matches!(event.command.as_str(), "about" | "solara" | "version") {
+            event.response_lines.push(format!(
+                "Solara-Sky v{} — Native Rust MC {} (protocol {}) with Folia-style multi-core region ticking.",
+                env!("CARGO_PKG_VERSION"),
+                sky_protocol::MINECRAFT_VERSION,
+                sky_protocol::PROTOCOL_VERSION
+            ));
+            event.handled = true;
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -18,7 +46,7 @@ use tracing::{info, warn};
     about = "High-performance Rust Minecraft: Java Edition 26.3 server"
 )]
 struct Cli {
-    /// Directory containing server.properties, solara-sky.toml, and world/region/
+    /// Directory containing server.properties, solara-sky.toml, ops.json, and world/region/
     #[arg(long, default_value = ".")]
     config_dir: PathBuf,
 
@@ -51,6 +79,8 @@ async fn main() -> Result<()> {
         protocol = sky_protocol::PROTOCOL_VERSION,
         online_mode = props.online_mode,
         proxy_mode = ?sky_cfg.proxy.mode,
+        target_tps = sky_cfg.performance.target_tps,
+        region_shift = sky_cfg.performance.region_shift_chunks,
         total_blocks = sky_world::generated_blocks::TOTAL_BLOCKS,
         total_block_states = sky_world::generated_blocks::TOTAL_BLOCK_STATES,
         "starting Solara-Sky server"
@@ -61,13 +91,24 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind TCP listener on {bind_addr}"))?;
 
-    let plugins = PluginManager::new();
+    let mut plugins = PluginManager::new();
+    let boot_info = ServerInfo {
+        brand: "solara-sky".into(),
+        minecraft_version: sky_protocol::MINECRAFT_VERSION.into(),
+        protocol_version: sky_protocol::PROTOCOL_VERSION,
+        online_players: 0,
+        max_players: props.max_players,
+    };
+    plugins.register(Box::new(SolaraCorePlugin), &boot_info);
+
     let shared = Arc::new(SharedServerState::new(
         &cli.config_dir,
         props,
         sky_cfg,
         plugins,
     )?);
+    let tick_handle = tick::spawn_region_tick_loop(Arc::clone(&shared));
+
     info!(address = %bind_addr, "Solara-Sky is listening for Minecraft 26.3 connections");
 
     loop {
@@ -86,7 +127,8 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("received shutdown signal, saving modified chunks to Anvil .mca...");
+                info!("received shutdown signal, stopping region ticker and saving modified Anvil chunks...");
+                tick_handle.abort();
                 match shared.world.save_dirty_chunks(false).await {
                     Ok(saved) => info!(saved_chunks = saved, "Anvil world save complete"),
                     Err(err) => warn!(error = %err, "failed to save dirty Anvil chunks on shutdown"),

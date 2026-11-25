@@ -23,6 +23,10 @@ pub enum BroadcastEvent {
         packet_id: i32,
         payload: Bytes,
     },
+    Kick {
+        target_username_lower: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,32 @@ impl LiveWorld {
             packet_id,
             payload: payload.into(),
         });
+    }
+
+    pub fn kick_player(&self, username: &str, reason: impl Into<String>) {
+        let _ = self.broadcast_tx.send(BroadcastEvent::Kick {
+            target_username_lower: username.to_ascii_lowercase(),
+            reason: reason.into(),
+        });
+    }
+
+    pub fn loaded_chunk_count(&self) -> usize {
+        self.chunks.read().expect("chunks lock").len()
+    }
+
+    pub fn with_chunks_read<R>(&self, f: impl FnOnce(&HashMap<ChunkPos, WorldChunk>) -> R) -> R {
+        let guard = self.chunks.read().expect("chunks lock");
+        f(&guard)
+    }
+
+    pub fn find_online_player(&self, username: &str) -> Option<ConnectedPlayer> {
+        let target = username.to_ascii_lowercase();
+        self.players
+            .read()
+            .expect("players lock")
+            .values()
+            .find(|p| p.username.to_ascii_lowercase() == target)
+            .cloned()
     }
 
     /// Fetches zero-copy `Bytes` chunk packets for `coords`. Cache misses (newly explored chunks or

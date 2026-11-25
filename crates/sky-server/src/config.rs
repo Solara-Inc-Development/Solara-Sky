@@ -12,6 +12,7 @@ pub struct ServerProperties {
     pub motd: String,
     pub max_players: usize,
     pub online_mode: bool,
+    pub white_list: bool,
     pub view_distance: u8,
     pub simulation_distance: u8,
     pub network_compression_threshold: i32,
@@ -27,6 +28,7 @@ impl Default for ServerProperties {
             motd: "A Solara-Sky Rust Server (MC 26.3)".into(),
             max_players: 100,
             online_mode: true,
+            white_list: false,
             view_distance: 10,
             simulation_distance: 10,
             network_compression_threshold: 256,
@@ -78,6 +80,9 @@ impl ServerProperties {
         if let Some(v) = map.get("online-mode").and_then(|s| s.parse().ok()) {
             p.online_mode = v;
         }
+        if let Some(v) = map.get("white-list").and_then(|s| s.parse().ok()) {
+            p.white_list = v;
+        }
         if let Some(v) = map.get("view-distance").and_then(|s| s.parse().ok()) {
             p.view_distance = v;
         }
@@ -107,6 +112,7 @@ impl ServerProperties {
              motd={}\n\
              max-players={}\n\
              online-mode={}\n\
+             white-list={}\n\
              view-distance={}\n\
              simulation-distance={}\n\
              network-compression-threshold={}\n\
@@ -117,6 +123,7 @@ impl ServerProperties {
             self.motd,
             self.max_players,
             self.online_mode,
+            self.white_list,
             self.view_distance,
             self.simulation_distance,
             self.network_compression_threshold,
@@ -151,15 +158,52 @@ impl Default for ProxyConfig {
     }
 }
 
+fn default_max_packet_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn default_target_tps() -> u32 {
+    20
+}
+fn default_region_shift() -> u8 {
+    4
+}
+fn default_random_tick_speed() -> u32 {
+    3
+}
+fn default_autosave_ticks() -> u64 {
+    6000
+}
+fn default_rate_limit() -> u32 {
+    600
+}
+
+/// Paper/Folia-style tuning settings in `solara-sky.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
+    #[serde(default = "default_max_packet_bytes")]
     pub max_packet_bytes: usize,
+    #[serde(default = "default_target_tps")]
+    pub target_tps: u32,
+    /// `2^region_shift_chunks` chunks per Folia region axis (`4` = `16x16` chunks per region).
+    #[serde(default = "default_region_shift")]
+    pub region_shift_chunks: u8,
+    #[serde(default = "default_random_tick_speed")]
+    pub random_tick_speed: u32,
+    #[serde(default = "default_autosave_ticks")]
+    pub autosave_interval_ticks: u64,
+    #[serde(default = "default_rate_limit")]
+    pub packet_rate_limit_per_sec: u32,
 }
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
-            max_packet_bytes: 2 * 1024 * 1024,
+            max_packet_bytes: default_max_packet_bytes(),
+            target_tps: default_target_tps(),
+            region_shift_chunks: default_region_shift(),
+            random_tick_speed: default_random_tick_speed(),
+            autosave_interval_ticks: default_autosave_ticks(),
+            packet_rate_limit_per_sec: default_rate_limit(),
         }
     }
 }
@@ -191,11 +235,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_online_and_offline_server_properties() {
-        let raw = "online-mode=false\nserver-port=25570\nmotd=Cracked Test\n";
+    fn parses_online_and_offline_server_properties_and_tuning_defaults() {
+        let raw = "online-mode=false\nwhite-list=true\nserver-port=25570\nmotd=Cracked Test\n";
         let props = ServerProperties::parse(raw);
         assert!(!props.online_mode);
+        assert!(props.white_list);
         assert_eq!(props.server_port, 25570);
         assert_eq!(props.motd, "Cracked Test");
+
+        let sky: SkyConfig = toml::from_str("[performance]\nmax_packet_bytes = 1048576\n")
+            .expect("backward-compatible toml");
+        assert_eq!(sky.performance.target_tps, 20);
+        assert_eq!(sky.performance.region_shift_chunks, 4);
+        assert_eq!(sky.performance.random_tick_speed, 3);
     }
 }
