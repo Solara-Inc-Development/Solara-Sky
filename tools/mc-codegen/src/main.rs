@@ -181,8 +181,10 @@ pub fn generate_blocks_rs(
         ("WATER", "minecraft:water"),
         ("SAND", "minecraft:sand"),
         ("OAK_LOG", "minecraft:oak_log"),
+        ("OAK_LEAVES", "minecraft:oak_leaves"),
         ("OAK_PLANKS", "minecraft:oak_planks"),
         ("GLASS", "minecraft:glass"),
+        ("GLOWSTONE", "minecraft:glowstone"),
         ("DEEPSLATE", "minecraft:deepslate"),
     ];
     writeln!(out, "pub mod default_state {{")?;

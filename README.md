@@ -2,7 +2,7 @@
 
 A fast, lightweight, open-source **Minecraft: Java Edition** server written in native Rust, built for low latency, low memory usage, and zero garbage-collection stalls.
 
-> **Status:** Early active development (Phase 0 / Phase 1 networking foundation). Not yet a complete survival server.
+> **Status:** Active development (Phases 0–4 complete: MC `26.3` login/auth, Velocity/BungeeCord forwarding, 32-registry Configuration sync, multi-core `rayon` procedural Overworld terrain & caves, Sky/Block lighting engine, multiplayer entities, commands & async Anvil `.mca` persistence).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux
 

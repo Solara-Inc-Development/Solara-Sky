@@ -5,6 +5,7 @@
 pub mod buf;
 pub mod config_play;
 pub mod crypto;
+pub mod entities;
 pub mod error;
 pub mod frame;
 pub mod generated_packets;

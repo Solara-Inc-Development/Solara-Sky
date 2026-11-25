@@ -10,8 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
 rand.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 rsa.workspace = true
 serde.workspace = true

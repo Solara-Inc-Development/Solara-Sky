@@ -3,6 +3,8 @@
 
 pub mod anvil;
 pub mod generated_blocks;
+pub mod lighting;
+pub mod terrain;
 
 use sky_protocol::buf::PacketWriter;
 
@@ -365,44 +367,72 @@ impl WorldChunk {
         self.sections[sec_idx].get(local_x, in_y, local_z)
     }
 
-    /// Encodes `ClientboundLevelChunkWithLightPacket` (`minecraft:level_chunk_with_light`) for MC 26.3.
+    /// Encodes `ClientboundLevelChunkWithLightPacket` (`minecraft:level_chunk_with_light`) for MC 26.3
+    /// using the real per-voxel Sky & Block lighting engine.
     pub fn encode_level_chunk_with_light(&self, write_long_len_prefix: bool) -> Vec<u8> {
+        let light = crate::lighting::compute_chunk_lighting(self);
         let mut section_buf = PacketWriter::with_capacity(4096);
         for sec in &self.sections {
             sec.write_network(&mut section_buf, write_long_len_prefix);
         }
 
-        let mut w = PacketWriter::with_capacity(section_buf.as_slice().len() + 13_000);
+        let mut sky_mask = 0u64;
+        let mut empty_sky_mask = 0u64;
+        let mut sky_arrays: Vec<&[u8; 2048]> = Vec::new();
+
+        let mut block_mask = 0u64;
+        let mut empty_block_mask = 0u64;
+        let mut block_arrays: Vec<&[u8; 2048]> = Vec::new();
+
+        // Light sections 1..=24 correspond to world sections 0..24 (-64..320)
+        for i in 0..OVERWORLD_SECTIONS {
+            let bit = 1u64 << (i + 1);
+            if light.sky_sections[i].iter().any(|&b| b != 0) {
+                sky_mask |= bit;
+                sky_arrays.push(&light.sky_sections[i]);
+            } else {
+                empty_sky_mask |= bit;
+            }
+
+            if light.block_sections[i].iter().any(|&b| b != 0) {
+                block_mask |= bit;
+                block_arrays.push(&light.block_sections[i]);
+            } else {
+                empty_block_mask |= bit;
+            }
+        }
+
+        let mut w = PacketWriter::with_capacity(
+            section_buf.as_slice().len() + (sky_arrays.len() + block_arrays.len()) * 2052 + 128,
+        );
         w.write_i32(self.pos.x);
         w.write_i32(self.pos.z);
 
-        // HEIGHTMAPS_STREAM_CODEC: Map<Heightmap.Types, long[]> -> empty map (0 entries)
+        // HEIGHTMAPS_STREAM_CODEC: Map<Heightmap.Types, long[]> -> empty map
         w.write_varint(0);
 
-        // Chunk section data byte array
         w.write_byte_array(section_buf.as_slice());
+        w.write_varint(0); // Block entities list
 
-        // Block entities list (0 entries)
-        w.write_varint(0);
-
-        // LightData: illuminate surface sections (light sections 1..=6 -> y = -64..32) with full sky light (15)
-        let sky_mask: u64 = 0b0111_1110; // 6 sections
-        w.write_varint(1); // skyYMask long count
+        w.write_varint(1);
         w.write_i64(sky_mask as i64);
+        w.write_varint(1);
+        w.write_i64(block_mask as i64);
+        w.write_varint(1);
+        w.write_i64(empty_sky_mask as i64);
+        w.write_varint(1);
+        w.write_i64(empty_block_mask as i64);
 
-        w.write_varint(0); // blockYMask long count
-        w.write_varint(0); // emptySkyYMask long count
-
-        w.write_varint(1); // emptyBlockYMask long count
-        w.write_i64(0x03FF_FFFF);
-
-        w.write_varint(6); // 6 sky light byte arrays of 2048 bytes each
-        let full_sky = [0xFFu8; 2048];
-        for _ in 0..6 {
-            w.write_byte_array(&full_sky);
+        w.write_varint(sky_arrays.len() as i32);
+        for arr in sky_arrays {
+            w.write_byte_array(arr);
         }
 
-        w.write_varint(0); // 0 block light arrays
+        w.write_varint(block_arrays.len() as i32);
+        for arr in block_arrays {
+            w.write_byte_array(arr);
+        }
+
         w.into_inner()
     }
 }

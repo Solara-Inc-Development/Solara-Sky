@@ -26,8 +26,10 @@ pub mod default_state {
     pub const WATER: u32 = 89;
     pub const SAND: u32 = 121;
     pub const OAK_LOG: u32 = 140;
+    pub const OAK_LEAVES: u32 = 294;
     pub const OAK_PLANKS: u32 = 15;
     pub const GLASS: u32 = 661;
+    pub const GLOWSTONE: u32 = 8686;
     pub const DEEPSLATE: u32 = 33774;
 }
 

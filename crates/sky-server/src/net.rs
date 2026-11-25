@@ -1,5 +1,5 @@
 use crate::config::{ProxyMode, ServerProperties, SkyConfig};
-use crate::world_state::{BroadcastEvent, ConnectedPlayer, LiveWorld};
+use crate::world_state::{BroadcastEvent, ConnectedPlayer, LiveWorld, WORLD_SEED};
 use anyhow::{Context, Result, bail};
 use rand::RngCore;
 use rsa::pkcs8::EncodePublicKey;
@@ -17,6 +17,10 @@ use sky_protocol::config_play::{
     encode_update_tags,
 };
 use sky_protocol::crypto::{MinecraftCipher, mojang_server_hash};
+use sky_protocol::entities::{
+    PlayerInfoEntry, encode_add_player_entity, encode_player_info_add, encode_player_info_remove,
+    encode_remove_entities, encode_teleport_entity,
+};
 use sky_protocol::error::ProtocolError;
 use sky_protocol::frame::{MAX_WIRE_FRAME_BYTES, decode_frame_body, encode_frame};
 use sky_protocol::packets::{
@@ -28,7 +32,8 @@ use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
 };
 use sky_protocol::{generated_packets, generated_registries};
-use sky_world::generated_blocks;
+use sky_world::{ChunkPos, generated_blocks};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +44,6 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Default 9-slot building palette mapped to hotbar slots `0..=8`.
 const HOTBAR_BLOCKS: [u32; 9] = [
     generated_blocks::default_state::STONE,
     generated_blocks::default_state::COBBLESTONE,
@@ -49,7 +53,7 @@ const HOTBAR_BLOCKS: [u32; 9] = [
     generated_blocks::default_state::GRASS_BLOCK,
     generated_blocks::default_state::SAND,
     generated_blocks::default_state::GLASS,
-    generated_blocks::default_state::DEEPSLATE,
+    generated_blocks::default_state::GLOWSTONE,
 ];
 
 pub struct SharedServerState {
@@ -90,9 +94,9 @@ impl SharedServerState {
             .build()
             .context("build HTTP client")?;
 
-        let radius = i32::from(props.view_distance.clamp(2, 6));
+        let radius = i32::from(props.view_distance.clamp(2, 16));
         let region_dir = config_dir.join("world").join("region");
-        let world = LiveWorld::load_or_generate(region_dir, radius)?;
+        let world = LiveWorld::load_or_generate(region_dir, radius.min(6))?;
 
         Ok(Self {
             props,
@@ -111,25 +115,39 @@ struct OnlinePlayerGuard<'a> {
     counter: &'a AtomicUsize,
     world: &'a LiveWorld,
     entity_id: i32,
+    uuid: Uuid,
 }
 
 impl<'a> OnlinePlayerGuard<'a> {
     fn acquire(counter: &'a AtomicUsize, world: &'a LiveWorld, player: ConnectedPlayer) -> Self {
         let entity_id = player.entity_id;
+        let uuid = player.uuid;
         counter.fetch_add(1, Ordering::Relaxed);
         world.add_player(player);
         Self {
             counter,
             world,
             entity_id,
+            uuid,
         }
     }
 }
 
 impl Drop for OnlinePlayerGuard<'_> {
     fn drop(&mut self) {
+        use generated_packets::play::clientbound as s2c;
         self.world.remove_player(self.entity_id);
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.world.broadcast_others(
+            self.entity_id,
+            s2c::REMOVE_ENTITIES,
+            encode_remove_entities(&[self.entity_id]),
+        );
+        self.world.broadcast_others(
+            self.entity_id,
+            s2c::PLAYER_INFO_REMOVE,
+            encode_player_info_remove(&[self.uuid]),
+        );
     }
 }
 
@@ -516,7 +534,7 @@ async fn handle_login(
     let finished = LoginFinishedS2c {
         uuid,
         username: username.clone(),
-        properties,
+        properties: properties.clone(),
         session_id,
     };
     conn.send_packet(LoginFinishedS2c::PACKET_ID, &finished.encode())
@@ -534,7 +552,7 @@ async fn handle_login(
         return Ok(());
     }
 
-    handle_play(conn, &username, uuid, state).await
+    handle_play(conn, &username, uuid, properties, state).await
 }
 
 async fn handle_configuration(conn: &mut FramedConnection, username: &str) -> Result<bool> {
@@ -599,6 +617,39 @@ async fn send_chat(conn: &mut FramedConnection, text: &str) -> Result<(), Protoc
         &encode_system_chat(text, false),
     )
     .await
+}
+
+async fn stream_missing_chunks(
+    conn: &mut FramedConnection,
+    center: ChunkPos,
+    radius: i32,
+    loaded_chunks: &mut HashSet<ChunkPos>,
+    world: &LiveWorld,
+) -> Result<()> {
+    use generated_packets::play::clientbound as s2c;
+    conn.send_packet(
+        s2c::SET_CHUNK_CACHE_CENTER,
+        &encode_set_chunk_cache_center(center.x, center.z),
+    )
+    .await?;
+
+    let mut needed = Vec::new();
+    for cz in (center.z - radius)..=(center.z + radius) {
+        for cx in (center.x - radius)..=(center.x + radius) {
+            let pos = ChunkPos { x: cx, z: cz };
+            if loaded_chunks.insert(pos) {
+                needed.push(pos);
+            }
+        }
+    }
+
+    if !needed.is_empty() {
+        let packets = world.get_or_generate_chunk_packets_batch(&needed).await?;
+        for (_pos, pkt) in packets {
+            conn.send_packet(s2c::LEVEL_CHUNK_WITH_LIGHT, &pkt).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn execute_command(
@@ -672,13 +723,20 @@ async fn execute_command(
                 parts[3].parse::<f64>(),
             ) {
                 *player_pos = [x, y, z];
-                state.world.update_player_pos(entity_id, *player_pos);
+                state
+                    .world
+                    .update_player_transform(entity_id, *player_pos, 0.0, 0.0);
                 *next_tp_id += 1;
                 conn.send_packet(
                     s2c::PLAYER_POSITION,
                     &encode_player_position(*next_tp_id, *player_pos, 0.0, 0.0),
                 )
                 .await?;
+                state.world.broadcast_others(
+                    entity_id,
+                    s2c::TELEPORT_ENTITY,
+                    encode_teleport_entity(entity_id, *player_pos, 0.0, 0.0, false),
+                );
                 send_chat(conn, &format!("Teleported to ({x:.1}, {y:.1}, {z:.1}).")).await?;
             } else {
                 send_chat(conn, "Invalid coordinates for /tp.").await?;
@@ -704,7 +762,7 @@ async fn execute_command(
                     if state.world.set_block(x, y, z, st) {
                         state
                             .world
-                            .broadcast_packet(s2c::BLOCK_UPDATE, encode_block_update(x, y, z, st));
+                            .broadcast_all(s2c::BLOCK_UPDATE, encode_block_update(x, y, z, st));
                         send_chat(conn, &format!("Placed {full_name} at ({x}, {y}, {z}).")).await?;
                     } else {
                         send_chat(conn, "Y coordinate must be within -64..319.").await?;
@@ -742,6 +800,7 @@ async fn handle_play(
     conn: &mut FramedConnection,
     username: &str,
     uuid: Uuid,
+    properties: Vec<ProfileProperty>,
     state: &SharedServerState,
 ) -> Result<()> {
     use generated_packets::play::{clientbound as s2c, serverbound as c2s};
@@ -750,18 +809,21 @@ async fn handle_play(
     let mut game_mode = GameMode::from_name(&state.props.gamemode);
     let spawn_pos = [8.0, -58.0, 8.0];
 
+    let existing_players = state.world.snapshot_players();
     let mut broadcast_rx = state.world.subscribe();
-    let _online_guard = OnlinePlayerGuard::acquire(
-        &state.online_players,
-        &state.world,
-        ConnectedPlayer {
-            entity_id,
-            username: username.to_owned(),
-            uuid,
-            position: spawn_pos,
-            game_mode,
-        },
-    );
+
+    let self_player = ConnectedPlayer {
+        entity_id,
+        username: username.to_owned(),
+        uuid,
+        properties: properties.clone(),
+        position: spawn_pos,
+        yaw_deg: 0.0,
+        pitch_deg: 0.0,
+        game_mode,
+    };
+    let _online_guard =
+        OnlinePlayerGuard::acquire(&state.online_players, &state.world, self_player);
 
     let overworld_dim_id = generated_registries::SYNCHRONIZED_REGISTRIES
         .iter()
@@ -769,47 +831,99 @@ async fn handle_play(
         .and_then(|(_, entries)| entries.iter().position(|&e| e == "minecraft:overworld"))
         .unwrap_or(0) as i32;
 
-    let radius = i32::from(state.props.view_distance.clamp(2, 6));
+    let view_radius = i32::from(state.props.view_distance.clamp(2, 16));
+    let sim_radius = i32::from(state.props.simulation_distance.clamp(2, 16));
+
     let login_pkt = PlayLoginS2c {
         entity_id,
         hardcore: false,
         dimension_names: vec!["minecraft:overworld".into()],
         max_players: state.props.max_players as i32,
-        view_distance: radius,
-        simulation_distance: radius,
+        view_distance: view_radius,
+        simulation_distance: sim_radius,
         reduced_debug_info: false,
         show_death_screen: true,
         do_limited_crafting: false,
         dimension_type_id: overworld_dim_id,
         dimension_name: "minecraft:overworld".into(),
-        hashed_seed: 0x501A_2A26_3000_0777,
+        hashed_seed: WORLD_SEED as i64,
         game_mode,
         is_debug: false,
-        is_flat: true,
+        is_flat: false,
         portal_cooldown: 0,
-        sea_level: -60,
+        sea_level: -56,
         online_mode: state.props.online_mode,
         enforces_secure_chat: false,
     };
     conn.send_packet(s2c::LOGIN, &login_pkt.encode()).await?;
 
     conn.send_packet(
-        s2c::SET_CHUNK_CACHE_CENTER,
-        &encode_set_chunk_cache_center(0, 0),
-    )
-    .await?;
-    conn.send_packet(
         s2c::GAME_EVENT,
         &encode_game_event(GAME_EVENT_START_WAITING_CHUNKS, 0.0),
     )
     .await?;
 
-    let chunk_packets = state.world.serialize_spawn_chunks();
-    let chunk_count = chunk_packets.len();
-    for chunk_bytes in &chunk_packets {
-        conn.send_packet(s2c::LEVEL_CHUNK_WITH_LIGHT, chunk_bytes)
-            .await?;
+    let mut current_center = ChunkPos { x: 0, z: 0 };
+    let mut loaded_chunks = HashSet::new();
+    stream_missing_chunks(
+        conn,
+        current_center,
+        view_radius,
+        &mut loaded_chunks,
+        &state.world,
+    )
+    .await?;
+
+    // Sync tab-list entries (self + existing players) and spawn existing visible player entities
+    let mut tab_entries: Vec<PlayerInfoEntry> = existing_players
+        .iter()
+        .map(|p| PlayerInfoEntry {
+            uuid: p.uuid,
+            username: p.username.clone(),
+            properties: p.properties.clone(),
+            game_mode: p.game_mode,
+            latency_ms: 10,
+        })
+        .collect();
+    let self_info = PlayerInfoEntry {
+        uuid,
+        username: username.to_owned(),
+        properties,
+        game_mode,
+        latency_ms: 5,
+    };
+    tab_entries.push(self_info.clone());
+    conn.send_packet(
+        s2c::PLAYER_INFO_UPDATE,
+        &encode_player_info_add(&tab_entries),
+    )
+    .await?;
+
+    for other in &existing_players {
+        conn.send_packet(
+            s2c::ADD_ENTITY,
+            &encode_add_player_entity(
+                other.entity_id,
+                other.uuid,
+                other.position,
+                other.yaw_deg,
+                other.pitch_deg,
+            ),
+        )
+        .await?;
     }
+
+    // Broadcast this new player's tab entry + visible 3D entity to all other online players!
+    state.world.broadcast_others(
+        entity_id,
+        s2c::PLAYER_INFO_UPDATE,
+        encode_player_info_add(&[self_info]),
+    );
+    state.world.broadcast_others(
+        entity_id,
+        s2c::ADD_ENTITY,
+        encode_add_player_entity(entity_id, uuid, spawn_pos, 0.0, 0.0),
+    );
 
     let mut next_tp_id = 1i32;
     conn.send_packet(
@@ -818,13 +932,13 @@ async fn handle_play(
     )
     .await?;
 
-    state.world.broadcast_packet(
+    state.world.broadcast_all(
         s2c::SYSTEM_CHAT,
         encode_system_chat(&format!("{username} joined the game"), false),
     );
     send_chat(
         conn,
-        "Welcome to Solara-Sky (MC 26.3)! Hotbar 1-9 selects blocks; type /help for commands.",
+        "Welcome to Solara-Sky (MC 26.3)! Procedural terrain, lighting & multiplayer entities active.",
     )
     .await?;
 
@@ -832,13 +946,15 @@ async fn handle_play(
         %username,
         %uuid,
         entity_id,
-        chunks = chunk_count,
-        "player spawned in Solara-Sky world"
+        chunks = loaded_chunks.len(),
+        "player spawned in Solara-Sky procedural world"
     );
 
     let mut keep_alive_tick = tokio::time::interval(Duration::from_secs(10));
     keep_alive_tick.tick().await;
     let mut player_pos = spawn_pos;
+    let mut player_yaw = 0.0f32;
+    let mut player_pitch = 0.0f32;
     let mut held_slot: usize = 0;
 
     loop {
@@ -853,14 +969,16 @@ async fn handle_play(
                 conn.send_packet(s2c::KEEP_ALIVE, w.as_slice()).await?;
             }
             bcast = broadcast_rx.recv() => {
-                if let Ok(BroadcastEvent::Packet { packet_id, payload }) = bcast {
+                if let Ok(BroadcastEvent::Packet { exclude_entity_id, packet_id, payload }) = bcast
+                    && exclude_entity_id != Some(entity_id)
+                {
                     conn.send_packet(packet_id, &payload).await?;
                 }
             }
             pkt_res = conn.read_packet() => {
                 let Some((pkt_id, payload)) = pkt_res? else {
                     info!(%username, "player disconnected cleanly");
-                    state.world.broadcast_packet(
+                    state.world.broadcast_all(
                         s2c::SYSTEM_CHAT,
                         encode_system_chat(&format!("{username} left the game"), false),
                     );
@@ -871,12 +989,61 @@ async fn handle_play(
                         let mut r = PacketReader::new(&payload);
                         let ack = AcceptTeleportC2s::decode(&mut r)?;
                         player_pos = [ack.x, ack.y, ack.z];
-                        state.world.update_player_pos(entity_id, player_pos);
+                        player_yaw = ack.yaw;
+                        player_pitch = ack.pitch;
+                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
                     }
-                    c2s::MOVE_PLAYER_POS | c2s::MOVE_PLAYER_POS_ROT => {
+                    c2s::MOVE_PLAYER_POS => {
                         let mut r = PacketReader::new(&payload);
                         player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
-                        state.world.update_player_pos(entity_id, player_pos);
+                        let flags = r.read_u8()?;
+                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
+                        state.world.broadcast_others(
+                            entity_id,
+                            s2c::TELEPORT_ENTITY,
+                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, (flags & 1) != 0),
+                        );
+                        let new_center = ChunkPos {
+                            x: (player_pos[0].floor() as i32).div_euclid(16),
+                            z: (player_pos[2].floor() as i32).div_euclid(16),
+                        };
+                        if new_center != current_center {
+                            current_center = new_center;
+                            stream_missing_chunks(conn, current_center, view_radius, &mut loaded_chunks, &state.world).await?;
+                        }
+                    }
+                    c2s::MOVE_PLAYER_POS_ROT => {
+                        let mut r = PacketReader::new(&payload);
+                        player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
+                        player_yaw = r.read_f32()?;
+                        player_pitch = r.read_f32()?;
+                        let flags = r.read_u8()?;
+                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
+                        state.world.broadcast_others(
+                            entity_id,
+                            s2c::TELEPORT_ENTITY,
+                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, (flags & 1) != 0),
+                        );
+                        let new_center = ChunkPos {
+                            x: (player_pos[0].floor() as i32).div_euclid(16),
+                            z: (player_pos[2].floor() as i32).div_euclid(16),
+                        };
+                        if new_center != current_center {
+                            current_center = new_center;
+                            stream_missing_chunks(conn, current_center, view_radius, &mut loaded_chunks, &state.world).await?;
+                        }
+                    }
+                    c2s::MOVE_PLAYER_ROT => {
+                        let mut r = PacketReader::new(&payload);
+                        player_yaw = r.read_f32()?;
+                        player_pitch = r.read_f32()?;
+                        let flags = r.read_u8()?;
+                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
+                        state.world.broadcast_others(
+                            entity_id,
+                            s2c::TELEPORT_ENTITY,
+                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, (flags & 1) != 0),
+                        );
                     }
                     c2s::SET_CARRIED_ITEM => {
                         let mut r = PacketReader::new(&payload);
@@ -895,7 +1062,7 @@ async fn handle_play(
                             let (bx, by, bz) = act.pos;
                             let air = generated_blocks::default_state::AIR;
                             if state.world.set_block(bx, by, bz, air) {
-                                state.world.broadcast_packet(
+                                state.world.broadcast_all(
                                     s2c::BLOCK_UPDATE,
                                     encode_block_update(bx, by, bz, air),
                                 );
@@ -921,7 +1088,7 @@ async fn handle_play(
                             if state.world.get_block(tx, ty, tz) == generated_blocks::default_state::AIR
                                 && state.world.set_block(tx, ty, tz, placed_state)
                             {
-                                state.world.broadcast_packet(
+                                state.world.broadcast_all(
                                     s2c::BLOCK_UPDATE,
                                     encode_block_update(tx, ty, tz, placed_state),
                                 );
@@ -938,7 +1105,7 @@ async fn handle_play(
                         let msg = decode_chat_message(&mut r)?;
                         if !msg.trim().is_empty() {
                             info!(%username, message = %msg, "chat");
-                            state.world.broadcast_packet(
+                            state.world.broadcast_all(
                                 s2c::SYSTEM_CHAT,
                                 encode_system_chat(&format!("<{username}> {msg}"), false),
                             );
@@ -960,7 +1127,6 @@ async fn handle_play(
                         .await?;
                     }
                     c2s::KEEP_ALIVE
-                    | c2s::MOVE_PLAYER_ROT
                     | c2s::MOVE_PLAYER_STATUS_ONLY
                     | c2s::CLIENT_TICK_END
                     | c2s::PLAYER_LOADED
