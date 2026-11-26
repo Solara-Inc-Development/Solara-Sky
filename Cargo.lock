@@ -1442,6 +1442,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-command"
+version = "0.1.0-alpha.1"
+
+[[package]]
+name = "sky-data"
+version = "0.1.0-alpha.1"
+
+[[package]]
+name = "sky-entity"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-data",
+ "uuid",
+]
+
+[[package]]
+name = "sky-inventory"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-data",
+]
+
+[[package]]
 name = "sky-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -1476,6 +1499,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sky-api",
+ "sky-command",
+ "sky-data",
+ "sky-entity",
+ "sky-inventory",
  "sky-protocol",
  "sky-world",
  "tokio",

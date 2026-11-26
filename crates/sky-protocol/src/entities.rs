@@ -67,10 +67,11 @@ pub fn encode_player_info_remove(uuids: &[Uuid]) -> Vec<u8> {
     w.into_inner()
 }
 
-/// Encodes `ClientboundAddEntityPacket` (`minecraft:add_entity`) for a visible remote player (`type = 159`).
-pub fn encode_add_player_entity(
+/// Encodes `ClientboundAddEntityPacket` (`minecraft:add_entity`) for any entity or mob (`entity_type`).
+pub fn encode_add_entity(
     entity_id: i32,
     uuid: Uuid,
+    entity_type: i32,
     pos: [f64; 3],
     yaw_deg: f32,
     pitch_deg: f32,
@@ -78,7 +79,7 @@ pub fn encode_add_player_entity(
     let mut w = PacketWriter::with_capacity(64);
     w.write_varint(entity_id);
     w.write_uuid(uuid);
-    w.write_varint(ENTITY_TYPE_PLAYER);
+    w.write_varint(entity_type);
     w.write_f64(pos[0]);
     w.write_f64(pos[1]);
     w.write_f64(pos[2]);
@@ -90,6 +91,17 @@ pub fn encode_add_player_entity(
     w.write_i8(yaw_b); // yHeadRot
     w.write_varint(0); // data
     w.into_inner()
+}
+
+/// Encodes `ClientboundAddEntityPacket` (`minecraft:add_entity`) for a visible remote player (`type = 159`).
+pub fn encode_add_player_entity(
+    entity_id: i32,
+    uuid: Uuid,
+    pos: [f64; 3],
+    yaw_deg: f32,
+    pitch_deg: f32,
+) -> Vec<u8> {
+    encode_add_entity(entity_id, uuid, ENTITY_TYPE_PLAYER, pos, yaw_deg, pitch_deg)
 }
 
 /// Decodes `(entity_id, uuid, entity_type, pos)` from `ClientboundAddEntityPacket`.

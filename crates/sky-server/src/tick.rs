@@ -5,7 +5,9 @@ use crate::net::SharedServerState;
 use rayon::prelude::*;
 use sky_api::RegionTickSummary;
 use sky_protocol::config_play::encode_block_update;
+use sky_protocol::entities::encode_teleport_entity;
 use sky_protocol::generated_packets;
+use sky_protocol::survival::encode_set_health;
 use sky_world::terrain::worker_threads;
 use sky_world::{ChunkPos, OVERWORLD_MIN_Y, generated_blocks};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -247,6 +249,22 @@ pub fn run_parallel_region_tick(
                 encode_block_update(wx, wy, wz, new_st),
             );
         }
+    }
+
+    // Step active world mobs & player survival vitals
+    let (moved_mobs, healed_players) = state.world.step_mobs_and_vitals(tick_number);
+    for mob in moved_mobs {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::TELEPORT_ENTITY,
+            encode_teleport_entity(mob.entity_id, mob.position, mob.yaw_deg, 0.0, true),
+        );
+    }
+    for (pid, vitals) in healed_players {
+        state.world.send_direct(
+            pid,
+            generated_packets::play::clientbound::SET_HEALTH,
+            encode_set_health(vitals.health, vitals.food, vitals.saturation),
+        );
     }
 
     (region_count, applied)

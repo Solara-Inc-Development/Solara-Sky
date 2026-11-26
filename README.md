@@ -16,10 +16,15 @@ A fast, lightweight, open-source **Minecraft: Java Edition** server written in n
 
 ## Workspace Layout
 
-- `crates/sky-protocol` — MC `26.3` (`777`) protocol primitives (`VarInt`, NBT, compression, AES-128-CFB8 crypto, packets, Velocity/BungeeCord forwarding)
-- `crates/sky-world` — Bit-packed paletted chunk storage, coordinates, generated block state metadata
-- `crates/sky-api` — Server plugin & event API foundations
-- `crates/sky-server` — Standalone `solara-sky` async TCP server binary (`server.properties` + `solara-sky.toml`)
+- `crates/sky-data` — Generated MC `26.3` (`777`) items (`1,658`), entity types (`161`), sound events (`1,991`), particles (`128`), and mob effects (`40`)
+- `crates/sky-protocol` — MC `26.3` (`777`) protocol primitives (`VarInt`, NBT, compression, AES-128-CFB8 crypto, packets, survival/combat codecs, Velocity/BungeeCord forwarding)
+- `crates/sky-world` — Bit-packed paletted chunk storage, `rayon` multi-core terrain/cave/tree generator, 24-section Sky/Block lighting, and async Anvil (`.mca`) persistence
+- `crates/sky-inventory` — `ItemStack`, 36-slot `PlayerInventory`, and core crafting recipes
+- `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, fall damage, regen), melee PvP/PvE knockback, and `WorldMob` AI
+- `crates/sky-command` — Brigadier-style command catalog and `Tab` auto-completion engine
+- `crates/sky-api` — Native Rust server plugin & event SDK (`SkyPlugin`)
+- `crates/sky-server` — Standalone `solara-sky` server binary, Folia-style parallel region ticker, TPS/MSPT profiler, and `ops.json`/`whitelist.json`/`banned-players.json` ACL
+- `docs/` & `packaging/` — Architecture guides, tuning docs, Docker & systemd deployment configs
 - `tools/mc-codegen` — Code generator from Mojang official `--reports` JSON
 
 ## Building & Testing

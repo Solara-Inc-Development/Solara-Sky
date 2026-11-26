@@ -11,6 +11,9 @@ use sky_api::{
     BlockChangeEvent, BlockChangeKind, ChatEvent, CommandEvent, PlayerPreLoginEvent, PluginManager,
     StatusPingEvent,
 };
+use sky_command::complete_command_input;
+use sky_entity::{MobKind, PlayerVitals};
+use sky_inventory::{ItemStack, PlayerInventory};
 use sky_protocol::buf::{PacketReader, PacketWriter};
 use sky_protocol::config_play::{
     AcceptTeleportC2s, GAME_EVENT_CHANGE_GAME_MODE, GAME_EVENT_START_WAITING_CHUNKS, GameMode,
@@ -23,8 +26,8 @@ use sky_protocol::config_play::{
 };
 use sky_protocol::crypto::{MinecraftCipher, mojang_server_hash};
 use sky_protocol::entities::{
-    PlayerInfoEntry, encode_add_player_entity, encode_player_info_add, encode_player_info_remove,
-    encode_remove_entities, encode_teleport_entity,
+    PlayerInfoEntry, encode_add_entity, encode_add_player_entity, encode_player_info_add,
+    encode_player_info_remove, encode_remove_entities, encode_teleport_entity,
 };
 use sky_protocol::error::ProtocolError;
 use sky_protocol::frame::{MAX_WIRE_FRAME_BYTES, decode_frame_body, encode_frame};
@@ -32,6 +35,11 @@ use sky_protocol::packets::{
     ClientIntent, HandshakeC2s, LoginCompressionS2c, LoginCustomQueryAnswerC2s,
     LoginCustomQueryS2c, LoginDisconnectS2c, LoginFinishedS2c, LoginHelloC2s, LoginHelloS2c,
     LoginKeyC2s, ProfileProperty, ServerStatusJson, offline_player_uuid, parse_bungeecord_address,
+};
+use sky_protocol::survival::{
+    CLIENT_CMD_PERFORM_RESPAWN, decode_attack_entity, decode_client_command,
+    decode_command_suggestion, encode_command_suggestions, encode_hurt_animation, encode_respawn,
+    encode_set_health,
 };
 use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
@@ -116,7 +124,7 @@ impl SharedServerState {
             acl,
             profiler,
             online_players: AtomicUsize::new(0),
-            next_entity_id: AtomicI32::new(1),
+            next_entity_id: AtomicI32::new(100),
             world,
         })
     }
@@ -747,9 +755,109 @@ async fn execute_command(
         "help" => {
             send_chat(
                 conn,
-                "Solara-Sky commands: /help, /list, /tps, /plugins, /seed, /gamemode, /tp, /setblock, /save, /op, /deop, /kick, /ban, /pardon, /whitelist",
+                "Solara-Sky commands: /help, /list, /tps, /plugins, /seed, /gamemode, /tp, /setblock, /heal, /feed, /kill, /spawnmob, /give, /clear, /save, /op, /deop, /kick, /ban, /pardon, /whitelist",
             )
             .await?;
+        }
+        "heal" => {
+            if let Some(v) = state.world.mutate_player(entity_id, |p| {
+                p.vitals.heal_full();
+                p.vitals
+            }) {
+                conn.send_packet(
+                    s2c::SET_HEALTH,
+                    &encode_set_health(v.health, v.food, v.saturation),
+                )
+                .await?;
+                send_chat(conn, "Restored health to 20.0 HP.").await?;
+            }
+        }
+        "feed" => {
+            if let Some(v) = state.world.mutate_player(entity_id, |p| {
+                p.vitals.feed_full();
+                p.vitals
+            }) {
+                conn.send_packet(
+                    s2c::SET_HEALTH,
+                    &encode_set_health(v.health, v.food, v.saturation),
+                )
+                .await?;
+                send_chat(conn, "Restored hunger to 20.").await?;
+            }
+        }
+        "kill" => {
+            if let Some(v) = state.world.mutate_player(entity_id, |p| {
+                p.vitals.health = 0.0;
+                p.vitals
+            }) {
+                conn.send_packet(s2c::SET_HEALTH, &encode_set_health(0.0, v.food, 0.0))
+                    .await?;
+                state.world.broadcast_all(
+                    s2c::SYSTEM_CHAT,
+                    encode_system_chat(&format!("{sender_username} fell out of the world"), false),
+                );
+            }
+        }
+        "spawnmob" | "summon" => {
+            let Some(&kind_str) = parts.get(1) else {
+                send_chat(conn, "Usage: /spawnmob <pig|cow|sheep|zombie>").await?;
+                return Ok(());
+            };
+            let Some(kind) = MobKind::from_name(kind_str) else {
+                send_chat(conn, "Supported mobs: pig, cow, sheep, zombie").await?;
+                return Ok(());
+            };
+            let mob_id = state.next_entity_id.fetch_add(1, Ordering::Relaxed);
+            let spawn_at = [player_pos[0] + 2.0, player_pos[1], player_pos[2] + 2.0];
+            let mob = state.world.spawn_mob(mob_id, kind, spawn_at);
+            state.world.broadcast_all(
+                s2c::ADD_ENTITY,
+                encode_add_entity(
+                    mob.entity_id,
+                    mob.uuid,
+                    mob.kind.protocol_entity_type(),
+                    mob.position,
+                    mob.yaw_deg,
+                    0.0,
+                ),
+            );
+            send_chat(
+                conn,
+                &format!(
+                    "Spawned {:?} (#{}) at ({:.1}, {:.1}, {:.1}).",
+                    kind, mob.entity_id, spawn_at[0], spawn_at[1], spawn_at[2]
+                ),
+            )
+            .await?;
+        }
+        "give" => {
+            let Some(&item_name) = parts.get(1) else {
+                send_chat(conn, "Usage: /give <item> [count]").await?;
+                return Ok(());
+            };
+            let count: u8 = parts
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1)
+                .clamp(1, 64);
+            if let Some(stack) = ItemStack::from_key(item_name, count) {
+                state.world.mutate_player(entity_id, |p| {
+                    let _ = p.inventory.insert(stack);
+                });
+                send_chat(
+                    conn,
+                    &format!("Gave {count}x {item_name} to {sender_username}."),
+                )
+                .await?;
+            } else {
+                send_chat(conn, &format!("Unknown item '{item_name}'.")).await?;
+            }
+        }
+        "clear" => {
+            state
+                .world
+                .mutate_player(entity_id, |p| p.inventory.clear());
+            send_chat(conn, "Cleared player inventory.").await?;
         }
         "tps" | "mspt" => {
             let r = state.profiler.snapshot();
@@ -1027,6 +1135,7 @@ async fn handle_play(
     let spawn_pos = [8.0, -58.0, 8.0];
 
     let existing_players = state.world.snapshot_players();
+    let existing_mobs = state.world.snapshot_mobs();
     let mut broadcast_rx = state.world.subscribe();
 
     let self_player = ConnectedPlayer {
@@ -1038,6 +1147,8 @@ async fn handle_play(
         yaw_deg: 0.0,
         pitch_deg: 0.0,
         game_mode,
+        vitals: PlayerVitals::new_full(spawn_pos[1]),
+        inventory: PlayerInventory::new_starter_kit(),
     };
     let _online_guard =
         OnlinePlayerGuard::acquire(&state.online_players, &state.world, self_player);
@@ -1130,6 +1241,24 @@ async fn handle_play(
         .await?;
     }
 
+    for mob in &existing_mobs {
+        conn.send_packet(
+            s2c::ADD_ENTITY,
+            &encode_add_entity(
+                mob.entity_id,
+                mob.uuid,
+                mob.kind.protocol_entity_type(),
+                mob.position,
+                mob.yaw_deg,
+                0.0,
+            ),
+        )
+        .await?;
+    }
+
+    conn.send_packet(s2c::SET_HEALTH, &encode_set_health(20.0, 20, 5.0))
+        .await?;
+
     // Broadcast this new player's tab entry + visible 3D entity to all other online players!
     state.world.broadcast_others(
         entity_id,
@@ -1192,6 +1321,11 @@ async fn handle_play(
                     {
                         conn.send_packet(packet_id, &payload).await?;
                     }
+                    Ok(BroadcastEvent::DirectPlayer { target_entity_id, packet_id, payload })
+                        if target_entity_id == entity_id =>
+                    {
+                        conn.send_packet(packet_id, &payload).await?;
+                    }
                     Ok(BroadcastEvent::Kick { target_username_lower, reason })
                         if target_username_lower == username.to_ascii_lowercase() =>
                     {
@@ -1223,11 +1357,34 @@ async fn handle_play(
                         let mut r = PacketReader::new(&payload);
                         player_pos = [r.read_f64()?, r.read_f64()?, r.read_f64()?];
                         let flags = r.read_u8()?;
-                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
+                        let on_ground = (flags & 1) != 0;
+                        if let Some((vitals, _dmg)) = state.world.record_player_movement(
+                            entity_id,
+                            player_pos,
+                            player_yaw,
+                            player_pitch,
+                            on_ground,
+                        ) {
+                            conn.send_packet(
+                                s2c::SET_HEALTH,
+                                &encode_set_health(vitals.health, vitals.food, vitals.saturation),
+                            )
+                            .await?;
+                            state.world.broadcast_all(
+                                s2c::HURT_ANIMATION,
+                                encode_hurt_animation(entity_id, 0.0),
+                            );
+                            if vitals.is_dead() {
+                                state.world.broadcast_all(
+                                    s2c::SYSTEM_CHAT,
+                                    encode_system_chat(&format!("{username} hit the ground too hard"), false),
+                                );
+                            }
+                        }
                         state.world.broadcast_others(
                             entity_id,
                             s2c::TELEPORT_ENTITY,
-                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, (flags & 1) != 0),
+                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, on_ground),
                         );
                         let new_center = ChunkPos {
                             x: (player_pos[0].floor() as i32).div_euclid(16),
@@ -1244,11 +1401,34 @@ async fn handle_play(
                         player_yaw = r.read_f32()?;
                         player_pitch = r.read_f32()?;
                         let flags = r.read_u8()?;
-                        state.world.update_player_transform(entity_id, player_pos, player_yaw, player_pitch);
+                        let on_ground = (flags & 1) != 0;
+                        if let Some((vitals, _dmg)) = state.world.record_player_movement(
+                            entity_id,
+                            player_pos,
+                            player_yaw,
+                            player_pitch,
+                            on_ground,
+                        ) {
+                            conn.send_packet(
+                                s2c::SET_HEALTH,
+                                &encode_set_health(vitals.health, vitals.food, vitals.saturation),
+                            )
+                            .await?;
+                            state.world.broadcast_all(
+                                s2c::HURT_ANIMATION,
+                                encode_hurt_animation(entity_id, 0.0),
+                            );
+                            if vitals.is_dead() {
+                                state.world.broadcast_all(
+                                    s2c::SYSTEM_CHAT,
+                                    encode_system_chat(&format!("{username} hit the ground too hard"), false),
+                                );
+                            }
+                        }
                         state.world.broadcast_others(
                             entity_id,
                             s2c::TELEPORT_ENTITY,
-                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, (flags & 1) != 0),
+                            encode_teleport_entity(entity_id, player_pos, player_yaw, player_pitch, on_ground),
                         );
                         let new_center = ChunkPos {
                             x: (player_pos[0].floor() as i32).div_euclid(16),
@@ -1258,6 +1438,141 @@ async fn handle_play(
                             current_center = new_center;
                             stream_missing_chunks(conn, current_center, view_radius, &mut loaded_chunks, &state.world).await?;
                         }
+                    }
+                    c2s::ATTACK => {
+                        let mut r = PacketReader::new(&payload);
+                        let target_id = decode_attack_entity(&mut r)?;
+                        if target_id != entity_id {
+                            if let Some((mob, hurt_yaw, died)) =
+                                state.world.attack_mob(target_id, player_pos, 5.0)
+                            {
+                                state.world.broadcast_all(
+                                    s2c::HURT_ANIMATION,
+                                    encode_hurt_animation(mob.entity_id, hurt_yaw),
+                                );
+                                if died {
+                                    state.world.broadcast_all(
+                                        s2c::REMOVE_ENTITIES,
+                                        encode_remove_entities(&[mob.entity_id]),
+                                    );
+                                } else {
+                                    state.world.broadcast_all(
+                                        s2c::TELEPORT_ENTITY,
+                                        encode_teleport_entity(
+                                            mob.entity_id,
+                                            mob.position,
+                                            mob.yaw_deg,
+                                            0.0,
+                                            true,
+                                        ),
+                                    );
+                                }
+                            } else if let Some((victim, _dealt, hurt_yaw)) =
+                                state.world.attack_player(target_id, player_pos, 4.0)
+                            {
+                                state.world.broadcast_all(
+                                    s2c::HURT_ANIMATION,
+                                    encode_hurt_animation(victim.entity_id, hurt_yaw),
+                                );
+                                state.world.send_direct(
+                                    victim.entity_id,
+                                    s2c::SET_HEALTH,
+                                    encode_set_health(
+                                        victim.vitals.health,
+                                        victim.vitals.food,
+                                        victim.vitals.saturation,
+                                    ),
+                                );
+                                state.world.send_direct(
+                                    victim.entity_id,
+                                    s2c::PLAYER_POSITION,
+                                    encode_player_position(
+                                        9000 + victim.entity_id,
+                                        victim.position,
+                                        victim.yaw_deg,
+                                        victim.pitch_deg,
+                                    ),
+                                );
+                                state.world.broadcast_others(
+                                    victim.entity_id,
+                                    s2c::TELEPORT_ENTITY,
+                                    encode_teleport_entity(
+                                        victim.entity_id,
+                                        victim.position,
+                                        victim.yaw_deg,
+                                        victim.pitch_deg,
+                                        false,
+                                    ),
+                                );
+                                if victim.vitals.is_dead() {
+                                    state.world.broadcast_all(
+                                        s2c::SYSTEM_CHAT,
+                                        encode_system_chat(
+                                            &format!("{} was slain by {username}", victim.username),
+                                            false,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    c2s::CLIENT_COMMAND => {
+                        let mut r = PacketReader::new(&payload);
+                        if decode_client_command(&mut r)? == CLIENT_CMD_PERFORM_RESPAWN {
+                            player_pos = spawn_pos;
+                            player_yaw = 0.0;
+                            player_pitch = 0.0;
+                            let vitals = state
+                                .world
+                                .mutate_player(entity_id, |p| {
+                                    p.position = spawn_pos;
+                                    p.vitals.respawn_reset(spawn_pos[1]);
+                                    p.vitals
+                                })
+                                .unwrap_or_else(|| PlayerVitals::new_full(spawn_pos[1]));
+                            conn.send_packet(
+                                s2c::RESPAWN,
+                                &encode_respawn(
+                                    overworld_dim_id,
+                                    "minecraft:overworld",
+                                    WORLD_SEED as i64,
+                                    game_mode,
+                                    -56,
+                                    0,
+                                ),
+                            )
+                            .await?;
+                            conn.send_packet(
+                                s2c::SET_HEALTH,
+                                &encode_set_health(vitals.health, vitals.food, vitals.saturation),
+                            )
+                            .await?;
+                            next_tp_id += 1;
+                            conn.send_packet(
+                                s2c::PLAYER_POSITION,
+                                &encode_player_position(next_tp_id, spawn_pos, 0.0, 0.0),
+                            )
+                            .await?;
+                            state.world.broadcast_others(
+                                entity_id,
+                                s2c::TELEPORT_ENTITY,
+                                encode_teleport_entity(entity_id, spawn_pos, 0.0, 0.0, true),
+                            );
+                        }
+                    }
+                    c2s::COMMAND_SUGGESTION => {
+                        let mut r = PacketReader::new(&payload);
+                        let (tx_id, input) = decode_command_suggestion(&mut r)?;
+                        let is_op = state.acl.is_op(username)
+                            || (!state.props.online_mode && !state.acl.has_any_ops());
+                        let online = state.world.online_usernames();
+                        let (start, length, matches) =
+                            complete_command_input(&input, is_op, &online);
+                        conn.send_packet(
+                            s2c::COMMAND_SUGGESTIONS,
+                            &encode_command_suggestions(tx_id, start, length, &matches),
+                        )
+                        .await?;
                     }
                     c2s::MOVE_PLAYER_ROT => {
                         let mut r = PacketReader::new(&payload);
@@ -1392,7 +1707,9 @@ async fn handle_play(
                     | c2s::PLAYER_LOADED
                     | c2s::CHUNK_BATCH_RECEIVED
                     | c2s::CLIENT_INFORMATION
-                    | c2s::CUSTOM_PAYLOAD => {}
+                    | c2s::CUSTOM_PAYLOAD
+                    | c2s::PUNCH
+                    | c2s::INTERACT => {}
                     other => {
                         debug!(%username, pkt_id = other, "ignoring unhandled Play packet");
                     }

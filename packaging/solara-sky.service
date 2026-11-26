@@ -1,0 +1,15 @@
+[Unit]
+Description=Solara-Sky Native Rust Server (MC 26.3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/solara-sky
+ExecStart=/opt/solara-sky/solara-sky --config-dir /opt/solara-sky
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

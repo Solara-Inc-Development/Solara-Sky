@@ -39,5 +39,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Tests
         run: cargo test --workspace --verbose
-      - name: Build Binary
-        run: cargo build --bin solara-sky
+      - name: Build Binaries
+        run: cargo build --bin solara-sky --bin mc-codegen
+      - name: Smoke Check Binaries (--help)
+        run: |
+          cargo run --bin solara-sky -- --help
+          cargo run --bin mc-codegen -- --help

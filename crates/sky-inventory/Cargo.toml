@@ -1,0 +1,8 @@
+[package]
+name = "sky-inventory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sky-data.workspace = true

@@ -1,8 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/sky-data",
     "crates/sky-protocol",
     "crates/sky-world",
+    "crates/sky-inventory",
+    "crates/sky-entity",
+    "crates/sky-command",
     "crates/sky-api",
     "crates/sky-server",
     "tools/mc-codegen",
@@ -41,8 +45,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v3", "v4", "serde"] }
 
+sky-data = { path = "crates/sky-data" }
 sky-protocol = { path = "crates/sky-protocol" }
 sky-world = { path = "crates/sky-world" }
+sky-inventory = { path = "crates/sky-inventory" }
+sky-entity = { path = "crates/sky-entity" }
+sky-command = { path = "crates/sky-command" }
 sky-api = { path = "crates/sky-api" }
 
 [profile.release]

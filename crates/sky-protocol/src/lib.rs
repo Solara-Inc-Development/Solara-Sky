@@ -12,6 +12,7 @@ pub mod generated_packets;
 pub mod generated_registries;
 pub mod nbt;
 pub mod packets;
+pub mod survival;
 pub mod varint;
 pub mod velocity;
 
