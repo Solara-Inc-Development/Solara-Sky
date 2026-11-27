@@ -9,6 +9,7 @@ use crate::net::{SharedServerState, handle_client};
 use anyhow::{Context, Result};
 use clap::Parser;
 use sky_api::{CommandEvent, PluginManager, PluginMeta, ServerInfo, SkyPlugin};
+use sky_scripting::LuaScriptPlugin;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -100,6 +101,14 @@ async fn main() -> Result<()> {
         max_players: props.max_players,
     };
     plugins.register(Box::new(SolaraCorePlugin), &boot_info);
+    match LuaScriptPlugin::load_directory(&cli.config_dir.join("plugins")) {
+        Ok(lua_plugins) => {
+            for lp in lua_plugins {
+                plugins.register(Box::new(lp), &boot_info);
+            }
+        }
+        Err(err) => warn!(error = %err, "failed to load Lua plugins directory"),
+    }
 
     let shared = Arc::new(SharedServerState::new(
         &cli.config_dir,

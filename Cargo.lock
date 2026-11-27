@@ -1486,6 +1486,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-scripting"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-api",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sky-server"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -1504,6 +1514,7 @@ dependencies = [
  "sky-entity",
  "sky-inventory",
  "sky-protocol",
+ "sky-scripting",
  "sky-world",
  "tokio",
  "toml",

@@ -1,4 +1,5 @@
 use sky_data::generated_items;
+use sky_data::generated_items::id as item_id;
 
 /// Compact 8-byte item stack representation (`item_id = 0` or `count = 0` represents empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,6 +32,14 @@ impl ItemStack {
         self.item_id == 0 || self.count == 0
     }
 
+    pub fn key(&self) -> Option<&'static str> {
+        if self.is_empty() {
+            None
+        } else {
+            generated_items::by_id(self.item_id).map(|d| d.key)
+        }
+    }
+
     pub fn max_stack_size(&self) -> u8 {
         if self.is_empty() {
             return 64;
@@ -51,6 +60,41 @@ impl ItemStack {
             }
             Some("minecraft:ender_pearl" | "minecraft:snowball" | "minecraft:egg") => 16,
             _ => 64,
+        }
+    }
+
+    /// Base melee attack damage when striking an entity with this item in main hand.
+    pub const fn melee_attack_damage(&self) -> f32 {
+        if self.is_empty() {
+            return 4.0;
+        }
+        match self.item_id {
+            item_id::WOODEN_SWORD => 4.5,
+            item_id::STONE_SWORD => 5.5,
+            item_id::IRON_SWORD => 6.5,
+            item_id::DIAMOND_SWORD => 7.5,
+            item_id::WOODEN_PICKAXE => 3.0,
+            item_id::STONE_PICKAXE => 3.5,
+            item_id::IRON_PICKAXE => 4.5,
+            item_id::DIAMOND_PICKAXE => 5.5,
+            _ => 4.0,
+        }
+    }
+
+    /// Returns `Some((food_points, saturation_bonus))` if this item is edible in Survival!
+    pub const fn food_nutrition(&self) -> Option<(i32, f32)> {
+        if self.is_empty() {
+            return None;
+        }
+        match self.item_id {
+            item_id::APPLE => Some((4, 2.4)),
+            item_id::BREAD => Some((5, 6.0)),
+            item_id::PORKCHOP => Some((3, 1.8)),
+            item_id::COOKED_PORKCHOP => Some((8, 12.8)),
+            item_id::BEEF => Some((3, 1.8)),
+            item_id::COOKED_BEEF => Some((8, 12.8)),
+            item_id::ROTTEN_FLESH => Some((4, 0.8)),
+            _ => None,
         }
     }
 }

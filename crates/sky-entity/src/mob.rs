@@ -1,4 +1,5 @@
 use sky_data::generated_entities::id as entity_id;
+use sky_data::generated_items::id as item_id;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,16 @@ impl MobKind {
 
     pub const fn is_hostile(self) -> bool {
         matches!(self, Self::Zombie)
+    }
+
+    /// Survival loot `(item_id, count)` dropped when this mob is defeated.
+    pub const fn death_loot(self) -> (u32, u8) {
+        match self {
+            Self::Pig => (item_id::PORKCHOP, 2),
+            Self::Cow => (item_id::BEEF, 2),
+            Self::Sheep => (item_id::WHITE_WOOL, 1),
+            Self::Zombie => (item_id::ROTTEN_FLESH, 2),
+        }
     }
 }
 

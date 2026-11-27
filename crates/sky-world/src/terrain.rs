@@ -137,6 +137,15 @@ impl TerrainGenerator {
         let log = generated_blocks::default_state::OAK_LOG;
         let leaves = generated_blocks::default_state::OAK_LEAVES;
         let glowstone = generated_blocks::default_state::GLOWSTONE;
+        let coal_ore =
+            generated_blocks::default_state_by_name("minecraft:coal_ore").unwrap_or(stone);
+        let iron_ore =
+            generated_blocks::default_state_by_name("minecraft:iron_ore").unwrap_or(stone);
+        let gold_ore = generated_blocks::default_state_by_name("minecraft:deepslate_gold_ore")
+            .unwrap_or(deepslate);
+        let diamond_ore =
+            generated_blocks::default_state_by_name("minecraft:deepslate_diamond_ore")
+                .unwrap_or(deepslate);
 
         let mut heights = [0i32; 256];
 
@@ -173,9 +182,23 @@ impl TerrainGenerator {
                     } else if y >= top_y - 3 {
                         if is_beach { sand } else { dirt }
                     } else if y < -52 {
-                        deepslate
+                        let ore_roll = hash3(self.seed ^ 0x0E2E_D1A0, wx, y, wz);
+                        if y <= -57 && ore_roll > 0.985 {
+                            diamond_ore
+                        } else if ore_roll > 0.965 {
+                            gold_ore
+                        } else {
+                            deepslate
+                        }
                     } else {
-                        stone
+                        let ore_roll = hash3(self.seed ^ 0x0E2E_C0A1, wx, y, wz);
+                        if ore_roll > 0.968 {
+                            iron_ore
+                        } else if ore_roll > 0.935 {
+                            coal_ore
+                        } else {
+                            stone
+                        }
                     };
                     chunk.set_world_block(lx, y, lz, block);
                 }

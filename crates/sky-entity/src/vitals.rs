@@ -47,6 +47,16 @@ impl PlayerVitals {
         self.saturation = 5.0;
     }
 
+    /// Consumes food in Survival if hungry (`food < 20`), restoring hunger & saturation.
+    pub fn eat_food(&mut self, food_points: i32, saturation_bonus: f32) -> bool {
+        if self.is_dead() || self.food >= MAX_FOOD {
+            return false;
+        }
+        self.food = (self.food + food_points).clamp(0, MAX_FOOD);
+        self.saturation = (self.saturation + saturation_bonus).min(self.food as f32);
+        true
+    }
+
     /// Applies incoming damage if outside hurt-invulnerability frames; returns actual damage dealt.
     pub fn apply_damage(&mut self, amount: f32) -> f32 {
         if amount <= 0.0 || self.hurt_invuln_ticks > 0 || self.is_dead() {

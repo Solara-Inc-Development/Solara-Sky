@@ -8,6 +8,7 @@ members = [
     "crates/sky-entity",
     "crates/sky-command",
     "crates/sky-api",
+    "crates/sky-scripting",
     "crates/sky-server",
     "tools/mc-codegen",
 ]
@@ -52,6 +53,7 @@ sky-inventory = { path = "crates/sky-inventory" }
 sky-entity = { path = "crates/sky-entity" }
 sky-command = { path = "crates/sky-command" }
 sky-api = { path = "crates/sky-api" }
+sky-scripting = { path = "crates/sky-scripting" }
 
 [profile.release]
 lto = "thin"

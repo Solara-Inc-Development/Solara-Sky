@@ -4,10 +4,13 @@ use crate::config::PerformanceConfig;
 use crate::net::SharedServerState;
 use rayon::prelude::*;
 use sky_api::RegionTickSummary;
-use sky_protocol::config_play::encode_block_update;
-use sky_protocol::entities::encode_teleport_entity;
+use sky_protocol::config_play::{encode_block_update, encode_system_chat};
+use sky_protocol::entities::{encode_remove_entities, encode_teleport_entity};
 use sky_protocol::generated_packets;
-use sky_protocol::survival::encode_set_health;
+use sky_protocol::survival::{
+    encode_hurt_animation, encode_set_health, encode_set_player_inventory_slot,
+    encode_set_time_26_3, encode_take_item_entity,
+};
 use sky_world::terrain::worker_threads;
 use sky_world::{ChunkPos, OVERWORLD_MIN_Y, generated_blocks};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -251,19 +254,72 @@ pub fn run_parallel_region_tick(
         }
     }
 
-    // Step active world mobs & player survival vitals
-    let (moved_mobs, healed_players) = state.world.step_mobs_and_vitals(tick_number);
-    for mob in moved_mobs {
+    // Advance Overworld clock & sync MC 26.3 WorldClock every 20 ticks (1s)
+    let (game_time, day_time) = state.world.advance_world_clock();
+    if tick_number.is_multiple_of(20) {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::SET_TIME,
+            encode_set_time_26_3(game_time, day_time, 1.0),
+        );
+    }
+
+    // Step active world mobs, zombie attacks, floating item auto-pickup & natural survival vitals
+    let outcome = state.world.step_mobs_and_vitals(tick_number);
+    for mob in outcome.moved_mobs {
         state.world.broadcast_all(
             generated_packets::play::clientbound::TELEPORT_ENTITY,
             encode_teleport_entity(mob.entity_id, mob.position, mob.yaw_deg, 0.0, true),
         );
     }
-    for (pid, vitals) in healed_players {
+    for (victim, hurt_yaw) in outcome.zombie_hits {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::HURT_ANIMATION,
+            encode_hurt_animation(victim.entity_id, hurt_yaw),
+        );
+        state.world.send_direct(
+            victim.entity_id,
+            generated_packets::play::clientbound::SET_HEALTH,
+            encode_set_health(
+                victim.vitals.health,
+                victim.vitals.food,
+                victim.vitals.saturation,
+            ),
+        );
+        if victim.vitals.is_dead() {
+            state.world.broadcast_all(
+                generated_packets::play::clientbound::SYSTEM_CHAT,
+                encode_system_chat(&format!("{} was slain by Zombie", victim.username), false),
+            );
+        }
+    }
+    for (pid, vitals) in outcome.healed_players {
         state.world.send_direct(
             pid,
             generated_packets::play::clientbound::SET_HEALTH,
             encode_set_health(vitals.health, vitals.food, vitals.saturation),
+        );
+    }
+    for (drop_id, collector_id, picked_count, inv) in outcome.picked_up_items {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::TAKE_ITEM_ENTITY,
+            encode_take_item_entity(drop_id, collector_id, picked_count),
+        );
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::REMOVE_ENTITIES,
+            encode_remove_entities(&[drop_id]),
+        );
+        for (slot_idx, st) in inv.main.iter().enumerate() {
+            state.world.send_direct(
+                collector_id,
+                generated_packets::play::clientbound::SET_PLAYER_INVENTORY,
+                encode_set_player_inventory_slot(slot_idx, st.item_id, st.count),
+            );
+        }
+    }
+    if !outcome.despawned_items.is_empty() {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::REMOVE_ENTITIES,
+            encode_remove_entities(&outcome.despawned_items),
         );
     }
 

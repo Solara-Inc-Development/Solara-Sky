@@ -1,0 +1,16 @@
+[package]
+name = "sky-scripting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lightweight zero-C-dependency Lua plugin scripting engine for Solara-Sky"
+
+[dependencies]
+sky-api.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

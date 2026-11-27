@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use rayon::prelude::*;
-use sky_entity::{MobKind, PlayerVitals, WorldMob, compute_melee_knockback};
-use sky_inventory::PlayerInventory;
+use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, WorldMob, compute_melee_knockback};
+use sky_inventory::{ItemStack, PlayerInventory};
 use sky_protocol::config_play::GameMode;
 use sky_protocol::packets::ProfileProperty;
 use sky_world::anvil::{AnvilRegion, region_coords, region_file_path};
@@ -11,6 +11,7 @@ use sky_world::{ChunkPos, WorldChunk, generated_blocks};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -50,8 +51,17 @@ pub struct ConnectedPlayer {
     pub inventory: PlayerInventory,
 }
 
+#[derive(Debug, Default)]
+pub struct WorldTickOutcome {
+    pub moved_mobs: Vec<WorldMob>,
+    pub healed_players: Vec<(i32, PlayerVitals)>,
+    pub zombie_hits: Vec<(ConnectedPlayer, f32)>,
+    pub picked_up_items: Vec<(i32, i32, u8, PlayerInventory)>,
+    pub despawned_items: Vec<i32>,
+}
+
 /// Thread-safe multi-core procedural Overworld chunk store, zero-copy `Bytes` packet cache,
-/// survival player roster, world mobs, and asynchronous Anvil (`.mca`) persistence.
+/// survival player roster, world mobs, floating item drops, Overworld clock, and Anvil persistence.
 pub struct LiveWorld {
     region_dir: PathBuf,
     generator: TerrainGenerator,
@@ -60,6 +70,9 @@ pub struct LiveWorld {
     dirty_chunks: RwLock<HashSet<ChunkPos>>,
     players: RwLock<HashMap<i32, ConnectedPlayer>>,
     mobs: RwLock<HashMap<i32, WorldMob>>,
+    item_drops: RwLock<HashMap<i32, WorldItemDrop>>,
+    game_time: AtomicI64,
+    day_time: AtomicI64,
     broadcast_tx: broadcast::Sender<BroadcastEvent>,
 }
 
@@ -147,6 +160,9 @@ impl LiveWorld {
             dirty_chunks: RwLock::new(HashSet::new()),
             players: RwLock::new(HashMap::new()),
             mobs: RwLock::new(initial_mobs),
+            item_drops: RwLock::new(HashMap::new()),
+            game_time: AtomicI64::new(0),
+            day_time: AtomicI64::new(1000),
             broadcast_tx,
         })
     }
@@ -189,6 +205,27 @@ impl LiveWorld {
             target_username_lower: username.to_ascii_lowercase(),
             reason: reason.into(),
         });
+    }
+
+    pub fn clock_snapshot(&self) -> (i64, i64) {
+        (
+            self.game_time.load(Ordering::Relaxed),
+            self.day_time.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn advance_world_clock(&self) -> (i64, i64) {
+        let gt = self.game_time.fetch_add(1, Ordering::Relaxed) + 1;
+        let prev_day = self.day_time.load(Ordering::Relaxed);
+        let next_day = (prev_day + 1).rem_euclid(24_000);
+        self.day_time.store(next_day, Ordering::Relaxed);
+        (gt, next_day)
+    }
+
+    pub fn set_day_time(&self, day_ticks: i64) -> (i64, i64) {
+        let normalized = day_ticks.rem_euclid(24_000);
+        self.day_time.store(normalized, Ordering::Relaxed);
+        (self.game_time.load(Ordering::Relaxed), normalized)
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
@@ -342,6 +379,15 @@ impl LiveWorld {
             .collect()
     }
 
+    pub fn snapshot_item_drops(&self) -> Vec<WorldItemDrop> {
+        self.item_drops
+            .read()
+            .expect("item_drops lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn spawn_mob(&self, entity_id: i32, kind: MobKind, pos: [f64; 3]) -> WorldMob {
         let mob = WorldMob::new(entity_id, kind, pos);
         self.mobs
@@ -349,6 +395,22 @@ impl LiveWorld {
             .expect("mobs lock")
             .insert(entity_id, mob.clone());
         mob
+    }
+
+    pub fn spawn_item_drop(
+        &self,
+        entity_id: i32,
+        item_id: u32,
+        count: u8,
+        pos: [f64; 3],
+    ) -> WorldItemDrop {
+        let now_tick = self.game_time.load(Ordering::Relaxed).max(0) as u64;
+        let drop = WorldItemDrop::new(entity_id, item_id, count, pos, now_tick);
+        self.item_drops
+            .write()
+            .expect("item_drops lock")
+            .insert(entity_id, drop.clone());
+        drop
     }
 
     pub fn add_player(&self, player: ConnectedPlayer) {
@@ -449,48 +511,116 @@ impl LiveWorld {
         Some((victim.clone(), dealt, hurt_yaw))
     }
 
-    /// Steps mob wandering/pursuit AI and player natural vitals for one tick (`50 ms`).
-    pub fn step_mobs_and_vitals(
-        &self,
-        tick_number: u64,
-    ) -> (Vec<WorldMob>, Vec<(i32, PlayerVitals)>) {
-        let survival_positions: Vec<[f64; 3]> = {
+    /// Steps mob wandering/pursuit AI, hostile zombie melee hits, floating item auto-pickup,
+    /// and player natural health regeneration for one tick (`50 ms`).
+    pub fn step_mobs_and_vitals(&self, tick_number: u64) -> WorldTickOutcome {
+        let mut out = WorldTickOutcome::default();
+
+        let survival_targets: Vec<(i32, [f64; 3])> = {
             let pguard = self.players.read().expect("players lock");
             pguard
                 .values()
                 .filter(|p| p.game_mode == GameMode::Survival && !p.vitals.is_dead())
-                .map(|p| p.position)
+                .map(|p| (p.entity_id, p.position))
                 .collect()
         };
 
-        let mut moved_mobs = Vec::new();
+        let mut pending_zombie_strikes: Vec<(i32, [f64; 3])> = Vec::new();
         {
             let mut mguard = self.mobs.write().expect("mobs lock");
             for mob in mguard.values_mut() {
-                let nearest = survival_positions.iter().copied().min_by(|a, b| {
+                let nearest = survival_targets.iter().copied().min_by(|(_, a), (_, b)| {
                     let da = (a[0] - mob.position[0]).powi(2) + (a[2] - mob.position[2]).powi(2);
                     let db = (b[0] - mob.position[0]).powi(2) + (b[2] - mob.position[2]).powi(2);
                     da.total_cmp(&db)
                 });
-                if mob.step_ai(tick_number, nearest, |wx, wz| {
+                if mob.step_ai(tick_number, nearest.map(|(_, pos)| pos), |wx, wz| {
                     self.generator.surface_height(wx, wz)
                 }) {
-                    moved_mobs.push(mob.clone());
+                    out.moved_mobs.push(mob.clone());
+                }
+                if mob.kind.is_hostile()
+                    && let Some((target_pid, ppos)) = nearest
+                {
+                    let d2 = (ppos[0] - mob.position[0]).powi(2)
+                        + (ppos[1] - mob.position[1]).powi(2)
+                        + (ppos[2] - mob.position[2]).powi(2);
+                    if d2 <= 1.65 * 1.65 {
+                        pending_zombie_strikes.push((target_pid, mob.position));
+                    }
                 }
             }
         }
 
-        let mut healed_players = Vec::new();
+        // Apply zombie melee strikes & natural survival regeneration
         {
             let mut pguard = self.players.write().expect("players lock");
+            for (pid, zpos) in pending_zombie_strikes {
+                if let Some(victim) = pguard.get_mut(&pid)
+                    && victim.vitals.apply_damage(3.0) > 0.0
+                {
+                    let (kb, hurt_yaw) = compute_melee_knockback(zpos, victim.position, 0.35);
+                    victim.position[0] += kb[0];
+                    victim.position[2] += kb[2];
+                    out.zombie_hits.push((victim.clone(), hurt_yaw));
+                }
+            }
             for p in pguard.values_mut() {
                 if p.vitals.tick_natural(tick_number) {
-                    healed_players.push((p.entity_id, p.vitals));
+                    out.healed_players.push((p.entity_id, p.vitals));
+                }
+            }
+
+            // Auto-pickup nearby floating item drops within 2.0 blocks!
+            let mut dguard = self.item_drops.write().expect("item_drops lock");
+            let drop_ids: Vec<i32> = dguard.keys().copied().collect();
+            for drop_id in drop_ids {
+                let Some(drop) = dguard.get(&drop_id).cloned() else {
+                    continue;
+                };
+                if tick_number > drop.spawn_tick + 6_000 {
+                    dguard.remove(&drop_id);
+                    out.despawned_items.push(drop_id);
+                    continue;
+                }
+                if tick_number < drop.spawn_tick + 4 {
+                    continue;
+                }
+                let collector_id = pguard
+                    .values()
+                    .filter(|p| !p.vitals.is_dead() && p.game_mode != GameMode::Spectator)
+                    .find(|p| {
+                        let dx = p.position[0] - drop.position[0];
+                        let dy = (p.position[1] + 0.5) - drop.position[1];
+                        let dz = p.position[2] - drop.position[2];
+                        dx * dx + dy * dy + dz * dz <= 2.15 * 2.15
+                    })
+                    .map(|p| p.entity_id);
+
+                if let Some(pid) = collector_id
+                    && let Some(collector) = pguard.get_mut(&pid)
+                {
+                    let stack = ItemStack::new(drop.item_id, drop.count);
+                    let leftover = collector.inventory.insert(stack);
+                    let picked = drop.count.saturating_sub(leftover.count);
+                    if picked > 0 {
+                        if leftover.is_empty() {
+                            dguard.remove(&drop_id);
+                        } else if let Some(d) = dguard.get_mut(&drop_id) {
+                            d.count = leftover.count;
+                        }
+                        out.picked_up_items.push((
+                            drop_id,
+                            pid,
+                            picked,
+                            collector.inventory.clone(),
+                        ));
+                    }
                 }
             }
         }
 
-        (moved_mobs, healed_players)
+        out
     }
 
     pub fn update_player_gamemode(&self, entity_id: i32, mode: GameMode) {

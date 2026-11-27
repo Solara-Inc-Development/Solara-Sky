@@ -2,7 +2,7 @@
 
 A fast, lightweight, open-source **Minecraft: Java Edition** server written in native Rust, built for low latency, low memory usage, and zero garbage-collection stalls.
 
-> **Status:** Active development (Phases 0–5 complete: MC `26.3` login/auth, Velocity/BungeeCord forwarding, Folia-style `rayon` multi-core regionized ticking, rolling TPS/MSPT profiler, `sky-api` plugins, ops/whitelist/bans, procedural Overworld terrain & caves, Sky/Block lighting engine, multiplayer entities & async Anvil `.mca` persistence).
+> **Status:** Active development (Phases 0–7 playable core complete: MC `26.3` login/auth, Velocity/BungeeCord forwarding, Folia-style `rayon` multi-core regionized ticking, TPS/MSPT profiler, `sky-api` + `.lua` `sky-scripting` plugins, procedural Overworld terrain/caves/ores, Sky/Block lighting, floating item drops & auto-pickup, 16 survival crafting recipes, food & PvP/mob combat, MC `26.3` `WorldClock` day/night cycle & async Anvil `.mca` persistence).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux
 
@@ -23,6 +23,7 @@ A fast, lightweight, open-source **Minecraft: Java Edition** server written in n
 - `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, fall damage, regen), melee PvP/PvE knockback, and `WorldMob` AI
 - `crates/sky-command` — Brigadier-style command catalog and `Tab` auto-completion engine
 - `crates/sky-api` — Native Rust server plugin & event SDK (`SkyPlugin`)
+- `crates/sky-scripting` — Lightweight `.lua` plugin loader (`plugins/*.lua`) for custom commands, MOTD overrides, and chat filters without recompiling Rust
 - `crates/sky-server` — Standalone `solara-sky` server binary, Folia-style parallel region ticker, TPS/MSPT profiler, and `ops.json`/`whitelist.json`/`banned-players.json` ACL
 - `docs/` & `packaging/` — Architecture guides, tuning docs, Docker & systemd deployment configs
 - `tools/mc-codegen` — Code generator from Mojang official `--reports` JSON
