@@ -7,7 +7,11 @@ pub enum MobKind {
     Pig,
     Cow,
     Sheep,
+    Chicken,
     Zombie,
+    Skeleton,
+    Spider,
+    Creeper,
 }
 
 impl MobKind {
@@ -22,7 +26,11 @@ impl MobKind {
             "pig" => Some(Self::Pig),
             "cow" => Some(Self::Cow),
             "sheep" => Some(Self::Sheep),
+            "chicken" => Some(Self::Chicken),
             "zombie" => Some(Self::Zombie),
+            "skeleton" => Some(Self::Skeleton),
+            "spider" => Some(Self::Spider),
+            "creeper" => Some(Self::Creeper),
             _ => None,
         }
     }
@@ -32,7 +40,11 @@ impl MobKind {
             Self::Pig => entity_id::PIG as i32,
             Self::Cow => entity_id::COW as i32,
             Self::Sheep => entity_id::SHEEP as i32,
+            Self::Chicken => entity_id::CHICKEN as i32,
             Self::Zombie => entity_id::ZOMBIE as i32,
+            Self::Skeleton => entity_id::SKELETON as i32,
+            Self::Spider => entity_id::SPIDER as i32,
+            Self::Creeper => entity_id::CREEPER as i32,
         }
     }
 
@@ -41,12 +53,35 @@ impl MobKind {
             Self::Pig => 10.0,
             Self::Cow => 10.0,
             Self::Sheep => 8.0,
-            Self::Zombie => 20.0,
+            Self::Chicken => 4.0,
+            Self::Zombie | Self::Skeleton | Self::Creeper => 20.0,
+            Self::Spider => 16.0,
         }
     }
 
     pub const fn is_hostile(self) -> bool {
-        matches!(self, Self::Zombie)
+        matches!(
+            self,
+            Self::Zombie | Self::Skeleton | Self::Spider | Self::Creeper
+        )
+    }
+
+    pub const fn chase_speed(self) -> f64 {
+        match self {
+            Self::Spider => 0.145,
+            Self::Zombie | Self::Creeper => 0.115,
+            Self::Skeleton => 0.105,
+            _ => 0.065,
+        }
+    }
+
+    pub const fn melee_damage(self) -> f32 {
+        match self {
+            Self::Creeper => 6.0,
+            Self::Zombie => 3.0,
+            Self::Spider | Self::Skeleton => 2.5,
+            _ => 0.0,
+        }
     }
 
     /// Survival loot `(item_id, count)` dropped when this mob is defeated.
@@ -55,7 +90,11 @@ impl MobKind {
             Self::Pig => (item_id::PORKCHOP, 2),
             Self::Cow => (item_id::BEEF, 2),
             Self::Sheep => (item_id::WHITE_WOOL, 1),
+            Self::Chicken => (item_id::FEATHER, 2),
             Self::Zombie => (item_id::ROTTEN_FLESH, 2),
+            Self::Skeleton => (item_id::BONE, 2),
+            Self::Spider => (item_id::STRING, 2),
+            Self::Creeper => (item_id::GUNPOWDER, 2),
         }
     }
 }
@@ -83,8 +122,7 @@ impl WorldMob {
         }
     }
 
-    /// Steps simple deterministic wandering / hostile-pursuit AI for one tick (`50 ms`).
-    /// `surface_y_fn` returns the terrain top block Y at `(wx, wz)` so mobs walk naturally over hills!
+    /// Steps deterministic wandering / hostile-pursuit AI for one tick (`50 ms`).
     pub fn step_ai(
         &mut self,
         tick_number: u64,
@@ -99,13 +137,12 @@ impl WorldMob {
             let dx = ppos[0] - self.position[0];
             let dz = ppos[2] - self.position[2];
             let dist = (dx * dx + dz * dz).sqrt();
-            if (1.1..20.0).contains(&dist) {
-                target_dir = Some((dx / dist, dz / dist, 0.115)); // ~2.3 m/s zombie chase
+            if (1.1..22.0).contains(&dist) {
+                target_dir = Some((dx / dist, dz / dist, self.kind.chase_speed()));
             }
         }
 
         if target_dir.is_none() {
-            // Peaceful deterministic wander phase
             let phase = (tick_number.wrapping_add(self.entity_id as u64 * 37)) % 120;
             if phase < 50 {
                 let angle_rad = (((tick_number / 120)
@@ -125,7 +162,6 @@ impl WorldMob {
         let nx = self.position[0] + vx * speed;
         let nz = self.position[2] + vz * speed;
         let ground_y = surface_y_fn(nx.floor() as i32, nz.floor() as i32) + 1;
-        // Avoid climbing sheer cliffs > 1 block high
         if (ground_y as f64 - self.position[1]).abs() > 1.25 {
             return false;
         }

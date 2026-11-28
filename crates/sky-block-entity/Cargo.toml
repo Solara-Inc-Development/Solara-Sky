@@ -1,0 +1,12 @@
+[package]
+name = "sky-block-entity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Persistent Chest storage and Folia-ticked Furnace smelting block entities for Solara-Sky"
+
+[dependencies]
+sky-data.workspace = true
+sky-inventory.workspace = true

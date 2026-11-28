@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use rayon::prelude::*;
+use sky_block_entity::{ChestBlockEntity, FurnaceBlockEntity};
 use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, WorldMob, compute_melee_knockback};
 use sky_inventory::{ItemStack, PlayerInventory};
 use sky_protocol::config_play::GameMode;
@@ -11,7 +12,7 @@ use sky_world::{ChunkPos, WorldChunk, generated_blocks};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -71,6 +72,9 @@ pub struct LiveWorld {
     players: RwLock<HashMap<i32, ConnectedPlayer>>,
     mobs: RwLock<HashMap<i32, WorldMob>>,
     item_drops: RwLock<HashMap<i32, WorldItemDrop>>,
+    chests: RwLock<HashMap<(i32, i32, i32), ChestBlockEntity>>,
+    furnaces: RwLock<HashMap<(i32, i32, i32), FurnaceBlockEntity>>,
+    raining: AtomicBool,
     game_time: AtomicI64,
     day_time: AtomicI64,
     broadcast_tx: broadcast::Sender<BroadcastEvent>,
@@ -127,13 +131,17 @@ impl LiveWorld {
             chunks.insert(pos, chunk);
         }
 
-        // Seed starter Overworld mobs around the spawn meadows (entity IDs 1..=4)
+        // Seed 8 diverse Overworld mobs around the spawn meadows (entity IDs 1..=8)
         let mut initial_mobs = HashMap::new();
         let starter_spawns = [
             (1, MobKind::Pig, 16, 8),
             (2, MobKind::Cow, -4, 14),
             (3, MobKind::Sheep, 12, -6),
-            (4, MobKind::Zombie, 22, 18),
+            (4, MobKind::Chicken, -8, -4),
+            (5, MobKind::Zombie, 24, 20),
+            (6, MobKind::Skeleton, -20, 22),
+            (7, MobKind::Spider, 26, -16),
+            (8, MobKind::Creeper, -22, -18),
         ];
         for (id, kind, wx, wz) in starter_spawns {
             let sy = (generator.surface_height(wx, wz) + 1) as f64;
@@ -161,6 +169,9 @@ impl LiveWorld {
             players: RwLock::new(HashMap::new()),
             mobs: RwLock::new(initial_mobs),
             item_drops: RwLock::new(HashMap::new()),
+            chests: RwLock::new(HashMap::new()),
+            furnaces: RwLock::new(HashMap::new()),
+            raining: AtomicBool::new(false),
             game_time: AtomicI64::new(0),
             day_time: AtomicI64::new(1000),
             broadcast_tx,
@@ -226,6 +237,82 @@ impl LiveWorld {
         let normalized = day_ticks.rem_euclid(24_000);
         self.day_time.store(normalized, Ordering::Relaxed);
         (self.game_time.load(Ordering::Relaxed), normalized)
+    }
+
+    pub fn is_raining(&self) -> bool {
+        self.raining.load(Ordering::Relaxed)
+    }
+
+    pub fn set_raining(&self, rain: bool) {
+        self.raining.store(rain, Ordering::Relaxed);
+    }
+
+    /// Deposits or withdraws items from a `minecraft:chest` at `pos`, returning `(summary, inventory_changed)`.
+    pub fn interact_chest(
+        &self,
+        entity_id: i32,
+        pos: (i32, i32, i32),
+        slot: usize,
+    ) -> Option<(String, PlayerInventory)> {
+        let mut pguard = self.players.write().expect("players lock");
+        let player = pguard.get_mut(&entity_id)?;
+        let mut cguard = self.chests.write().expect("chests lock");
+        let chest = cguard.entry(pos).or_default();
+
+        let held = player.inventory.main[slot];
+        let msg = if !held.is_empty() {
+            let leftover = chest.deposit(held);
+            player.inventory.main[slot] = leftover;
+            format!("[Chest] Stored stack -> contents: {}", chest.summary())
+        } else if let Some(withdrawn) = chest.withdraw_first() {
+            let leftover = player.inventory.insert(withdrawn);
+            if !leftover.is_empty() {
+                let _ = chest.deposit(leftover);
+            }
+            format!("[Chest] Withdrew item -> remaining: {}", chest.summary())
+        } else {
+            "[Chest] Chest is empty (hold an item & right-click to deposit).".to_owned()
+        };
+        Some((msg, player.inventory.clone()))
+    }
+
+    /// Interacts with a `minecraft:furnace` at `pos` (collects smelted output or loads ore/food/fuel).
+    pub fn interact_furnace(
+        &self,
+        entity_id: i32,
+        pos: (i32, i32, i32),
+        slot: usize,
+    ) -> Option<(String, PlayerInventory)> {
+        let mut pguard = self.players.write().expect("players lock");
+        let player = pguard.get_mut(&entity_id)?;
+        let mut fguard = self.furnaces.write().expect("furnaces lock");
+        let furnace = fguard.entry(pos).or_default();
+
+        let held = player.inventory.main[slot];
+        let (taken, collected) = furnace.interact(held);
+        if taken > 0 {
+            let _ = player.inventory.consume_slot(slot, taken);
+        }
+        if let Some(out_stack) = collected {
+            let _ = player.inventory.insert(out_stack);
+        }
+        let summary = format!(
+            "[Furnace] In: {}x | Fuel: {}x | Out: {}x | Burn: {}t",
+            furnace.input.count, furnace.fuel.count, furnace.output.count, furnace.burn_ticks_left
+        );
+        Some((summary, player.inventory.clone()))
+    }
+
+    /// Removes any Chest or Furnace block entity at `pos` when broken, returning stored stacks to drop!
+    pub fn drain_broken_block_entity(&self, pos: (i32, i32, i32)) -> Vec<ItemStack> {
+        let mut out = Vec::new();
+        if let Some(mut c) = self.chests.write().expect("chests lock").remove(&pos) {
+            out.extend(c.drain_all());
+        }
+        if let Some(mut f) = self.furnaces.write().expect("furnaces lock").remove(&pos) {
+            out.extend(f.drain_all());
+        }
+        out
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
@@ -525,7 +612,15 @@ impl LiveWorld {
                 .collect()
         };
 
-        let mut pending_zombie_strikes: Vec<(i32, [f64; 3])> = Vec::new();
+        // Tick active furnaces (smelting raw iron, sand, cobblestone, meats)
+        {
+            let mut fguard = self.furnaces.write().expect("furnaces lock");
+            for furnace in fguard.values_mut() {
+                let _ = furnace.tick_smelt();
+            }
+        }
+
+        let mut pending_hostile_strikes: Vec<(i32, [f64; 3], f32)> = Vec::new();
         {
             let mut mguard = self.mobs.write().expect("mobs lock");
             for mob in mguard.values_mut() {
@@ -546,20 +641,24 @@ impl LiveWorld {
                         + (ppos[1] - mob.position[1]).powi(2)
                         + (ppos[2] - mob.position[2]).powi(2);
                     if d2 <= 1.65 * 1.65 {
-                        pending_zombie_strikes.push((target_pid, mob.position));
+                        pending_hostile_strikes.push((
+                            target_pid,
+                            mob.position,
+                            mob.kind.melee_damage(),
+                        ));
                     }
                 }
             }
         }
 
-        // Apply zombie melee strikes & natural survival regeneration
+        // Apply hostile mob melee strikes & natural survival regeneration
         {
             let mut pguard = self.players.write().expect("players lock");
-            for (pid, zpos) in pending_zombie_strikes {
+            for (pid, mpos, dmg) in pending_hostile_strikes {
                 if let Some(victim) = pguard.get_mut(&pid)
-                    && victim.vitals.apply_damage(3.0) > 0.0
+                    && victim.vitals.apply_damage(dmg) > 0.0
                 {
-                    let (kb, hurt_yaw) = compute_melee_knockback(zpos, victim.position, 0.35);
+                    let (kb, hurt_yaw) = compute_melee_knockback(mpos, victim.position, 0.35);
                     victim.position[0] += kb[0];
                     victim.position[2] += kb[2];
                     out.zombie_hits.push((victim.clone(), hurt_yaw));

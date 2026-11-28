@@ -102,9 +102,11 @@ pub static BUILTIN_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "spawnmob",
         aliases: &["summon"],
-        usage: "/spawnmob <pig|cow|sheep|zombie>",
+        usage: "/spawnmob <pig|cow|sheep|chicken|zombie|skeleton|spider|creeper>",
         requires_op: false,
-        arg_hints: &["pig", "cow", "sheep", "zombie"],
+        arg_hints: &[
+            "pig", "cow", "sheep", "chicken", "zombie", "skeleton", "spider", "creeper",
+        ],
         completes_players: false,
     },
     CommandSpec {
@@ -178,6 +180,14 @@ pub static BUILTIN_COMMANDS: &[CommandSpec] = &[
         usage: "/time <day|noon|sunset|night|ticks>",
         requires_op: false,
         arg_hints: &["day", "noon", "sunset", "night"],
+        completes_players: false,
+    },
+    CommandSpec {
+        name: "weather",
+        aliases: &[],
+        usage: "/weather <clear|rain|thunder>",
+        requires_op: false,
+        arg_hints: &["clear", "rain", "thunder"],
         completes_players: false,
     },
     CommandSpec {

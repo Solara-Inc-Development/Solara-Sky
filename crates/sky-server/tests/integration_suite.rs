@@ -1,4 +1,5 @@
 use sky_api::{CommandEvent, SkyPlugin};
+use sky_block_entity::{COOK_DURATION_TICKS, ChestBlockEntity, FurnaceBlockEntity};
 use sky_command::complete_command_input;
 use sky_data::{generated_entities, generated_items};
 use sky_entity::{MobKind, PlayerVitals, WorldMob, block_survival_drop};
@@ -21,14 +22,53 @@ fn cross_crate_survival_crafting_ores_lua_and_worldgen_integration() {
     assert_eq!(inv.insert(sword), ItemStack::EMPTY);
     assert!(sword.melee_attack_damage() > 7.0);
 
-    assert_eq!(
-        generated_entities::by_key("zombie").unwrap().id,
-        MobKind::Zombie.protocol_entity_type() as u32
-    );
+    for (key, kind) in [
+        ("zombie", MobKind::Zombie),
+        ("creeper", MobKind::Creeper),
+        ("skeleton", MobKind::Skeleton),
+        ("spider", MobKind::Spider),
+        ("chicken", MobKind::Chicken),
+    ] {
+        assert_eq!(
+            generated_entities::by_key(key).unwrap().id,
+            kind.protocol_entity_type() as u32
+        );
+    }
     assert!(generated_items::by_key("golden_apple").is_some());
     assert_eq!(
         block_survival_drop("minecraft:coal_ore"),
         Some((generated_items::id::COAL, 1))
+    );
+
+    let mut chest = ChestBlockEntity::new();
+    assert_eq!(
+        chest.deposit(ItemStack::new(generated_items::id::IRON_INGOT, 8)),
+        ItemStack::EMPTY
+    );
+    assert_eq!(
+        chest.withdraw_first(),
+        Some(ItemStack::new(generated_items::id::IRON_INGOT, 8))
+    );
+
+    let mut furnace = FurnaceBlockEntity::new();
+    assert_eq!(
+        furnace
+            .interact(ItemStack::new(generated_items::id::RAW_IRON, 1))
+            .0,
+        1
+    );
+    assert_eq!(
+        furnace
+            .interact(ItemStack::new(generated_items::id::COAL, 1))
+            .0,
+        1
+    );
+    for _ in 0..COOK_DURATION_TICKS {
+        let _ = furnace.tick_smelt();
+    }
+    assert_eq!(
+        furnace.interact(ItemStack::EMPTY).1,
+        Some(ItemStack::new(generated_items::id::IRON_INGOT, 1))
     );
 
     let gen_engine = TerrainGenerator::new(12345);
@@ -36,7 +76,7 @@ fn cross_crate_survival_crafting_ores_lua_and_worldgen_integration() {
         .generate_and_encode_batch_parallel(&[ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }]);
     assert_eq!(batch.len(), 2);
 
-    let mut mob = WorldMob::new(10, MobKind::Pig, [8.0, -59.0, 8.0]);
+    let mut mob = WorldMob::new(10, MobKind::Creeper, [8.0, -59.0, 8.0]);
     let _ = mob.step_ai(5, None, |x, z| gen_engine.surface_height(x, z));
 
     let mut vitals = PlayerVitals::new_full(-50.0);
@@ -65,6 +105,6 @@ fn cross_crate_survival_crafting_ores_lua_and_worldgen_integration() {
     assert!(cmd_ev.handled);
     assert_eq!(cmd_ev.response_lines, vec!["Play fair, Steve!"]);
 
-    let (_, _, suggestions) = complete_command_input("/cr", false, &[]);
-    assert!(suggestions.contains(&"craft".to_owned()));
+    let (_, _, suggestions) = complete_command_input("/wea", false, &[]);
+    assert!(suggestions.contains(&"weather".to_owned()));
 }

@@ -40,8 +40,8 @@ use sky_protocol::packets::{
 use sky_protocol::survival::{
     CLIENT_CMD_PERFORM_RESPAWN, decode_attack_entity, decode_client_command,
     decode_command_suggestion, decode_use_item, encode_animate, encode_command_suggestions,
-    encode_hurt_animation, encode_respawn, encode_set_health, encode_set_player_inventory_slot,
-    encode_set_time_26_3,
+    encode_hurt_animation, encode_level_event, encode_respawn, encode_set_health,
+    encode_set_player_inventory_slot, encode_set_time_26_3,
 };
 use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
@@ -814,11 +814,19 @@ async fn execute_command(
         }
         "spawnmob" | "summon" => {
             let Some(&kind_str) = parts.get(1) else {
-                send_chat(conn, "Usage: /spawnmob <pig|cow|sheep|zombie>").await?;
+                send_chat(
+                    conn,
+                    "Usage: /spawnmob <pig|cow|sheep|chicken|zombie|skeleton|spider|creeper>",
+                )
+                .await?;
                 return Ok(());
             };
             let Some(kind) = MobKind::from_name(kind_str) else {
-                send_chat(conn, "Supported mobs: pig, cow, sheep, zombie").await?;
+                send_chat(
+                    conn,
+                    "Supported mobs: pig, cow, sheep, chicken, zombie, skeleton, spider, creeper",
+                )
+                .await?;
                 return Ok(());
             };
             let mob_id = state.next_entity_id.fetch_add(1, Ordering::Relaxed);
@@ -973,6 +981,46 @@ async fn execute_command(
                 send_chat(conn, &format!("Set Overworld time to {dt} ticks.")).await?;
             } else {
                 send_chat(conn, "Usage: /time <day|noon|sunset|night|ticks>").await?;
+            }
+        }
+        "weather" => {
+            let Some(&mode) = parts.get(1) else {
+                let cur = if state.world.is_raining() {
+                    "rain"
+                } else {
+                    "clear"
+                };
+                send_chat(
+                    conn,
+                    &format!("Current weather: {cur}. Usage: /weather <clear|rain|thunder>"),
+                )
+                .await?;
+                return Ok(());
+            };
+            match mode.to_ascii_lowercase().as_str() {
+                "clear" | "sun" => {
+                    state.world.set_raining(false);
+                    state
+                        .world
+                        .broadcast_all(s2c::GAME_EVENT, encode_game_event(2, 0.0));
+                    state
+                        .world
+                        .broadcast_all(s2c::GAME_EVENT, encode_game_event(7, 0.0));
+                    send_chat(conn, "Changing to clear sky.").await?;
+                }
+                "rain" | "thunder" | "storm" => {
+                    state.world.set_raining(true);
+                    state
+                        .world
+                        .broadcast_all(s2c::GAME_EVENT, encode_game_event(1, 0.0));
+                    state
+                        .world
+                        .broadcast_all(s2c::GAME_EVENT, encode_game_event(7, 1.0));
+                    send_chat(conn, "Changing to rain.").await?;
+                }
+                _ => {
+                    send_chat(conn, "Usage: /weather <clear|rain|thunder>").await?;
+                }
             }
         }
         "tps" | "mspt" => {
@@ -1392,6 +1440,12 @@ async fn handle_play(
     let (gt, dt) = state.world.clock_snapshot();
     conn.send_packet(s2c::SET_TIME, &encode_set_time_26_3(gt, dt, 1.0))
         .await?;
+    if state.world.is_raining() {
+        conn.send_packet(s2c::GAME_EVENT, &encode_game_event(1, 0.0))
+            .await?;
+        conn.send_packet(s2c::GAME_EVENT, &encode_game_event(7, 1.0))
+            .await?;
+    }
     sync_player_inventory(conn, &starter_inv).await?;
 
     conn.send_packet(s2c::SET_HEALTH, &encode_set_health(20.0, 20, 5.0))
@@ -1827,6 +1881,32 @@ async fn handle_play(
                                     s2c::BLOCK_UPDATE,
                                     encode_block_update(bx, by, bz, air),
                                 );
+                                state.world.broadcast_all(
+                                    s2c::LEVEL_EVENT,
+                                    encode_level_event(2001, (bx, by, bz), old_state as i32, false),
+                                );
+                                // Drop any items stored inside broken Chest or Furnace block entities!
+                                for stored in state.world.drain_broken_block_entity((bx, by, bz)) {
+                                    let drop_eid =
+                                        state.next_entity_id.fetch_add(1, Ordering::Relaxed);
+                                    let drop = state.world.spawn_item_drop(
+                                        drop_eid,
+                                        stored.item_id,
+                                        stored.count,
+                                        [bx as f64 + 0.5, by as f64 + 0.35, bz as f64 + 0.5],
+                                    );
+                                    state.world.broadcast_all(
+                                        s2c::ADD_ENTITY,
+                                        encode_add_entity(
+                                            drop.entity_id,
+                                            drop.uuid,
+                                            WorldItemDrop::PROTOCOL_ENTITY_TYPE,
+                                            drop.position,
+                                            0.0,
+                                            0.0,
+                                        ),
+                                    );
+                                }
                                 if game_mode == GameMode::Survival
                                     && let Some(br) = generated_blocks::block_by_state_id(old_state)
                                     && let Some((drop_item, drop_cnt)) =
@@ -1864,6 +1944,39 @@ async fn handle_play(
                         let mut r = PacketReader::new(&payload);
                         let use_pkt = UseItemOnC2s::decode(&mut r)?;
                         if use_pkt.hand == 0 {
+                            let clicked_state =
+                                state.world.get_block(use_pkt.pos.0, use_pkt.pos.1, use_pkt.pos.2);
+                            let clicked_name = generated_blocks::block_by_state_id(clicked_state)
+                                .map(|b| b.name)
+                                .unwrap_or("");
+                            if clicked_name == "minecraft:chest" {
+                                if let Some((msg, inv)) =
+                                    state.world.interact_chest(entity_id, use_pkt.pos, held_slot)
+                                {
+                                    sync_player_inventory(conn, &inv).await?;
+                                    send_chat(conn, &msg).await?;
+                                }
+                                conn.send_packet(
+                                    s2c::BLOCK_CHANGED_ACK,
+                                    &encode_block_changed_ack(use_pkt.sequence),
+                                )
+                                .await?;
+                                continue;
+                            } else if clicked_name == "minecraft:furnace" {
+                                if let Some((msg, inv)) =
+                                    state.world.interact_furnace(entity_id, use_pkt.pos, held_slot)
+                                {
+                                    sync_player_inventory(conn, &inv).await?;
+                                    send_chat(conn, &msg).await?;
+                                }
+                                conn.send_packet(
+                                    s2c::BLOCK_CHANGED_ACK,
+                                    &encode_block_changed_ack(use_pkt.sequence),
+                                )
+                                .await?;
+                                continue;
+                            }
+
                             let (dx, dy, dz) = direction_offset(use_pkt.direction);
                             let (tx, ty, tz) = (
                                 use_pkt.pos.0 + dx,

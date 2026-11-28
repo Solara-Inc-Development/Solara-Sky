@@ -32,6 +32,32 @@ pub fn encode_animate(entity_id: i32, action: u8) -> Vec<u8> {
     w.into_inner()
 }
 
+/// Encodes `ClientboundLevelEventPacket` (`s2c::LEVEL_EVENT = 0x2F`):
+/// `(type: i32, pos: BlockPos, data: i32, globalEvent: bool)` — `type = 2001` spawns block-break particles + SFX!
+pub fn encode_level_event(
+    event_type: i32,
+    pos: (i32, i32, i32),
+    data: i32,
+    global: bool,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(20);
+    w.write_i32(event_type);
+    w.write_block_pos(pos.0, pos.1, pos.2);
+    w.write_i32(data);
+    w.write_bool(global);
+    w.into_inner()
+}
+
+/// Encodes `ClientboundBlockDestructionPacket` (`s2c::BLOCK_DESTRUCTION = 0x05`):
+/// `(id: VarInt, pos: BlockPos, progress: u8)`.
+pub fn encode_block_destruction(breaker_id: i32, pos: (i32, i32, i32), progress: u8) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(16);
+    w.write_varint(breaker_id);
+    w.write_block_pos(pos.0, pos.1, pos.2);
+    w.write_u8(progress);
+    w.into_inner()
+}
+
 /// Encodes MC `26.3` `ClientboundSetTimePacket` (`s2c::SET_TIME = 0x73`):
 /// `(gameTime: i64, clockUpdates: Map<Holder<WorldClock>, ClockNetworkState>)`
 /// where Overworld `WorldClock` holder ID is `0` (`holderRegistry`), followed by `(VarLong totalTicks, f32 partialTick, f32 rate)`.

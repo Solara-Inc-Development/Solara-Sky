@@ -5,6 +5,7 @@ members = [
     "crates/sky-protocol",
     "crates/sky-world",
     "crates/sky-inventory",
+    "crates/sky-block-entity",
     "crates/sky-entity",
     "crates/sky-command",
     "crates/sky-api",
@@ -50,6 +51,7 @@ sky-data = { path = "crates/sky-data" }
 sky-protocol = { path = "crates/sky-protocol" }
 sky-world = { path = "crates/sky-world" }
 sky-inventory = { path = "crates/sky-inventory" }
+sky-block-entity = { path = "crates/sky-block-entity" }
 sky-entity = { path = "crates/sky-entity" }
 sky-command = { path = "crates/sky-command" }
 sky-api = { path = "crates/sky-api" }

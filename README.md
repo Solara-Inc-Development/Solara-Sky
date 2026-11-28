@@ -19,8 +19,9 @@ A fast, lightweight, open-source **Minecraft: Java Edition** server written in n
 - `crates/sky-data` — Generated MC `26.3` (`777`) items (`1,658`), entity types (`161`), sound events (`1,991`), particles (`128`), and mob effects (`40`)
 - `crates/sky-protocol` — MC `26.3` (`777`) protocol primitives (`VarInt`, NBT, compression, AES-128-CFB8 crypto, packets, survival/combat codecs, Velocity/BungeeCord forwarding)
 - `crates/sky-world` — Bit-packed paletted chunk storage, `rayon` multi-core terrain/cave/tree generator, 24-section Sky/Block lighting, and async Anvil (`.mca`) persistence
-- `crates/sky-inventory` — `ItemStack`, 36-slot `PlayerInventory`, and core crafting recipes
-- `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, fall damage, regen), melee PvP/PvE knockback, and `WorldMob` AI
+- `crates/sky-inventory` — `ItemStack`, 36-slot `PlayerInventory`, and 16 core crafting recipes
+- `crates/sky-block-entity` — Persistent 27-slot `ChestBlockEntity` storage and Folia-ticked `FurnaceBlockEntity` ore/food smelting
+- `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, fall damage, regen), melee PvP/PvE knockback, floating `WorldItemDrop` loot, and 8-species `WorldMob` AI (`Pig`, `Cow`, `Sheep`, `Chicken`, `Zombie`, `Skeleton`, `Spider`, `Creeper`)
 - `crates/sky-command` — Brigadier-style command catalog and `Tab` auto-completion engine
 - `crates/sky-api` — Native Rust server plugin & event SDK (`SkyPlugin`)
 - `crates/sky-scripting` — Lightweight `.lua` plugin loader (`plugins/*.lua`) for custom commands, MOTD overrides, and chat filters without recompiling Rust

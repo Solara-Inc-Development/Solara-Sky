@@ -2,8 +2,10 @@
 //! and generated MC 26.3 block tables.
 
 pub mod anvil;
+pub mod biomes;
 pub mod generated_blocks;
 pub mod lighting;
+pub mod structures;
 pub mod terrain;
 
 use sky_protocol::buf::PacketWriter;
