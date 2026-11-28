@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use rayon::prelude::*;
 use sky_block_entity::{ChestBlockEntity, FurnaceBlockEntity};
+use sky_effects::PlayerEffects;
 use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, WorldMob, compute_melee_knockback};
 use sky_inventory::{ItemStack, PlayerInventory};
 use sky_projectile::WorldArrow;
@@ -51,6 +52,8 @@ pub struct ConnectedPlayer {
     pub game_mode: GameMode,
     pub vitals: PlayerVitals,
     pub inventory: PlayerInventory,
+    pub effects: PlayerEffects,
+    pub bed_spawn: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +62,7 @@ pub struct WorldTickOutcome {
     pub moved_arrows: Vec<WorldArrow>,
     pub arrow_hit_mobs: Vec<(WorldMob, f32, bool)>,
     pub xp_updates: Vec<(i32, PlayerVitals)>,
+    pub expired_effects: Vec<(i32, u32)>,
     pub healed_players: Vec<(i32, PlayerVitals)>,
     pub zombie_hits: Vec<(ConnectedPlayer, f32)>,
     pub picked_up_items: Vec<(i32, i32, u8, PlayerInventory)>,
@@ -454,6 +458,22 @@ impl LiveWorld {
         true
     }
 
+    /// Recomputes 24-section Sky & Block lighting for `cpos` (e.g. after Torch/Glowstone edit) and caches the packet.
+    pub fn reencode_chunk_packet(&self, cpos: ChunkPos) -> Option<Bytes> {
+        let chunk_clone = self
+            .chunks
+            .read()
+            .expect("chunks lock")
+            .get(&cpos)
+            .cloned()?;
+        let pkt = Bytes::from(chunk_clone.encode_level_chunk_with_light(false));
+        self.chunk_packet_cache
+            .write()
+            .expect("packet cache lock")
+            .insert(cpos, pkt.clone());
+        Some(pkt)
+    }
+
     pub fn snapshot_players(&self) -> Vec<ConnectedPlayer> {
         self.players
             .read()
@@ -645,8 +665,15 @@ impl LiveWorld {
         if matches!(victim.game_mode, GameMode::Creative | GameMode::Spectator) {
             return None;
         }
+        let shield_mult =
+            if victim.inventory.held_stack().item_id == sky_data::generated_items::id::SHIELD {
+                0.50
+            } else {
+                1.0
+            };
+        let eff_dmg = damage * shield_mult * victim.effects.damage_resistance_multiplier();
         let armor_pts = victim.inventory.total_armor_points();
-        let dealt = victim.vitals.apply_damage_with_armor(damage, armor_pts);
+        let dealt = victim.vitals.apply_damage_with_armor(eff_dmg, armor_pts);
         if dealt <= 0.0 {
             return None;
         }
@@ -710,13 +737,21 @@ impl LiveWorld {
             }
         }
 
-        // Apply hostile mob melee strikes & natural survival regeneration
+        // Apply hostile mob melee strikes, active status potion effects & natural survival regeneration
         {
             let mut pguard = self.players.write().expect("players lock");
             for (pid, mpos, dmg) in pending_hostile_strikes {
                 if let Some(victim) = pguard.get_mut(&pid) {
+                    let shield_mult = if victim.inventory.held_stack().item_id
+                        == sky_data::generated_items::id::SHIELD
+                    {
+                        0.50
+                    } else {
+                        1.0
+                    };
+                    let eff_dmg = dmg * shield_mult * victim.effects.damage_resistance_multiplier();
                     let armor_pts = victim.inventory.total_armor_points();
-                    if victim.vitals.apply_damage_with_armor(dmg, armor_pts) > 0.0 {
+                    if victim.vitals.apply_damage_with_armor(eff_dmg, armor_pts) > 0.0 {
                         let (kb, hurt_yaw) = compute_melee_knockback(mpos, victim.position, 0.35);
                         victim.position[0] += kb[0];
                         victim.position[2] += kb[2];
@@ -725,7 +760,19 @@ impl LiveWorld {
                 }
             }
             for p in pguard.values_mut() {
+                let (regen_hp, expired) = p.effects.tick(tick_number);
+                for eid in expired {
+                    out.expired_effects.push((p.entity_id, eid));
+                }
+                let mut changed = false;
+                if regen_hp > 0.0 && !p.vitals.is_dead() && p.vitals.health < 20.0 {
+                    p.vitals.health = (p.vitals.health + regen_hp).min(20.0);
+                    changed = true;
+                }
                 if p.vitals.tick_natural(tick_number) {
+                    changed = true;
+                }
+                if changed {
                     out.healed_players.push((p.entity_id, p.vitals));
                 }
             }

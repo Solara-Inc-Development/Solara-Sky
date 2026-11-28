@@ -22,6 +22,7 @@ sky-api.workspace = true
 sky-block-entity.workspace = true
 sky-command.workspace = true
 sky-data.workspace = true
+sky-effects.workspace = true
 sky-entity.workspace = true
 sky-inventory.workspace = true
 sky-projectile.workspace = true

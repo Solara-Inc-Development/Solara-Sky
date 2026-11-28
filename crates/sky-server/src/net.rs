@@ -12,7 +12,9 @@ use sky_api::{
     StatusPingEvent,
 };
 use sky_command::complete_command_input;
+use sky_data::generated_effects::id as effect_id;
 use sky_data::generated_items::id as item_id;
+use sky_effects::{PlayerEffects, effect_id_from_name};
 use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, block_survival_drop};
 use sky_inventory::recipes::CORE_RECIPES;
 use sky_inventory::{ItemStack, PlayerInventory};
@@ -42,8 +44,9 @@ use sky_protocol::packets::{
 use sky_protocol::survival::{
     CLIENT_CMD_PERFORM_RESPAWN, decode_attack_entity, decode_client_command,
     decode_command_suggestion, decode_use_item_rot, encode_animate, encode_command_suggestions,
-    encode_hurt_animation, encode_level_event, encode_respawn, encode_set_experience,
-    encode_set_health, encode_set_player_inventory_slot, encode_set_time_26_3,
+    encode_hurt_animation, encode_level_event, encode_remove_mob_effect, encode_respawn,
+    encode_set_experience, encode_set_health, encode_set_player_inventory_slot,
+    encode_set_time_26_3, encode_update_mob_effect,
 };
 use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
@@ -984,6 +987,52 @@ async fn execute_command(
                 .await?;
             }
         }
+        "effect" => {
+            let Some(&eff_name) = parts.get(1) else {
+                send_chat(
+                    conn,
+                    "Usage: /effect <speed|strength|regeneration|resistance|night_vision|clear> [seconds]",
+                )
+                .await?;
+                return Ok(());
+            };
+            if eff_name.eq_ignore_ascii_case("clear") {
+                if let Some(removed) = state.world.mutate_player(entity_id, |p| p.effects.clear()) {
+                    for eid in &removed {
+                        conn.send_packet(
+                            s2c::REMOVE_MOB_EFFECT,
+                            &encode_remove_mob_effect(entity_id, *eid),
+                        )
+                        .await?;
+                    }
+                    send_chat(conn, &format!("Cleared {} status effects.", removed.len())).await?;
+                }
+                return Ok(());
+            }
+            let Some(eid) = effect_id_from_name(eff_name) else {
+                send_chat(
+                    conn,
+                    "Supported effects: speed, strength, regeneration, resistance, night_vision, clear",
+                )
+                .await?;
+                return Ok(());
+            };
+            let secs: i32 = parts
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30)
+                .clamp(1, 3600);
+            let ticks = secs * 20;
+            state.world.mutate_player(entity_id, |p| {
+                p.effects.apply(eid, 0, ticks);
+            });
+            conn.send_packet(
+                s2c::UPDATE_MOB_EFFECT,
+                &encode_update_mob_effect(entity_id, eid, 0, ticks),
+            )
+            .await?;
+            send_chat(conn, &format!("Applied {eff_name} for {secs}s.")).await?;
+        }
         "time" => {
             let token = match (parts.get(1).copied(), parts.get(2).copied()) {
                 (Some("set"), Some(val)) => Some(val),
@@ -1349,6 +1398,8 @@ async fn handle_play(
         game_mode,
         vitals: PlayerVitals::new_full(spawn_pos[1]),
         inventory: starter_inv.clone(),
+        effects: PlayerEffects::new(),
+        bed_spawn: None,
     };
     let _online_guard =
         OnlinePlayerGuard::acquire(&state.online_players, &state.world, self_player);
@@ -1687,7 +1738,10 @@ async fn handle_play(
                         if target_id != entity_id {
                             let weapon_dmg = state
                                 .world
-                                .mutate_player(entity_id, |p| p.inventory.held_stack().melee_attack_damage())
+                                .mutate_player(entity_id, |p| {
+                                    p.inventory.held_stack().melee_attack_damage()
+                                        + p.effects.melee_damage_bonus()
+                                })
                                 .unwrap_or(4.0);
                             if let Some((mob, hurt_yaw, died)) =
                                 state.world.attack_mob(target_id, player_pos, weapon_dmg.max(5.0))
@@ -1811,17 +1865,28 @@ async fn handle_play(
                     c2s::CLIENT_COMMAND => {
                         let mut r = PacketReader::new(&payload);
                         if decode_client_command(&mut r)? == CLIENT_CMD_PERFORM_RESPAWN {
-                            player_pos = spawn_pos;
-                            player_yaw = 0.0;
-                            player_pitch = 0.0;
-                            let vitals = state
+                            let (target_spawn, vitals, cleared_fx) = state
                                 .world
                                 .mutate_player(entity_id, |p| {
-                                    p.position = spawn_pos;
-                                    p.vitals.respawn_reset(spawn_pos[1]);
-                                    p.vitals
+                                    let dest = p.bed_spawn.unwrap_or(spawn_pos);
+                                    p.position = dest;
+                                    p.vitals.respawn_reset(dest[1]);
+                                    let cleared = p.effects.clear();
+                                    (dest, p.vitals, cleared)
                                 })
-                                .unwrap_or_else(|| PlayerVitals::new_full(spawn_pos[1]));
+                                .unwrap_or_else(|| {
+                                    (spawn_pos, PlayerVitals::new_full(spawn_pos[1]), Vec::new())
+                                });
+                            player_pos = target_spawn;
+                            player_yaw = 0.0;
+                            player_pitch = 0.0;
+                            for eid in cleared_fx {
+                                conn.send_packet(
+                                    s2c::REMOVE_MOB_EFFECT,
+                                    &encode_remove_mob_effect(entity_id, eid),
+                                )
+                                .await?;
+                            }
                             conn.send_packet(
                                 s2c::RESPAWN,
                                 &encode_respawn(
@@ -1842,13 +1907,13 @@ async fn handle_play(
                             next_tp_id += 1;
                             conn.send_packet(
                                 s2c::PLAYER_POSITION,
-                                &encode_player_position(next_tp_id, spawn_pos, 0.0, 0.0),
+                                &encode_player_position(next_tp_id, target_spawn, 0.0, 0.0),
                             )
                             .await?;
                             state.world.broadcast_others(
                                 entity_id,
                                 s2c::TELEPORT_ENTITY,
-                                encode_teleport_entity(entity_id, spawn_pos, 0.0, 0.0, true),
+                                encode_teleport_entity(entity_id, target_spawn, 0.0, 0.0, true),
                             );
                         }
                     }
@@ -1964,13 +2029,21 @@ async fn handle_play(
                                     )
                                     .await?;
                                 }
-                            } else if let Some(Some((vitals, updated_slot))) =
+                            } else if let Some(Some((vitals, updated_slot, gapple))) =
                                 state.world.mutate_player(entity_id, |p| {
                                     let held = p.inventory.main[held_slot];
                                     let (pts, sat) = held.food_nutrition()?;
-                                    if p.vitals.eat_food(pts, sat) {
+                                    let is_gapple = held.item_id == item_id::GOLDEN_APPLE;
+                                    if is_gapple || p.vitals.eat_food(pts, sat) {
+                                        if is_gapple {
+                                            p.vitals.food = (p.vitals.food + pts).clamp(0, 20);
+                                            p.vitals.saturation =
+                                                (p.vitals.saturation + sat).min(20.0);
+                                            p.effects.apply(effect_id::REGENERATION, 1, 100);
+                                            p.effects.apply(effect_id::RESISTANCE, 0, 1200);
+                                        }
                                         let slot_after = p.inventory.consume_slot(held_slot, 1)?;
-                                        Some((p.vitals, slot_after))
+                                        Some((p.vitals, slot_after, is_gapple))
                                     } else {
                                         None
                                     }
@@ -1990,6 +2063,28 @@ async fn handle_play(
                                     ),
                                 )
                                 .await?;
+                                if gapple {
+                                    conn.send_packet(
+                                        s2c::UPDATE_MOB_EFFECT,
+                                        &encode_update_mob_effect(
+                                            entity_id,
+                                            effect_id::REGENERATION,
+                                            1,
+                                            100,
+                                        ),
+                                    )
+                                    .await?;
+                                    conn.send_packet(
+                                        s2c::UPDATE_MOB_EFFECT,
+                                        &encode_update_mob_effect(
+                                            entity_id,
+                                            effect_id::RESISTANCE,
+                                            0,
+                                            1200,
+                                        ),
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         conn.send_packet(s2c::BLOCK_CHANGED_ACK, &encode_block_changed_ack(seq))
@@ -2026,6 +2121,16 @@ async fn handle_play(
                                     s2c::LEVEL_EVENT,
                                     encode_level_event(2001, (bx, by, bz), old_state as i32, false),
                                 );
+                                if sky_world::lighting::block_emission(old_state) > 0
+                                    && let Some(cpkt) = state.world.reencode_chunk_packet(ChunkPos {
+                                        x: bx.div_euclid(16),
+                                        z: bz.div_euclid(16),
+                                    })
+                                {
+                                    state
+                                        .world
+                                        .broadcast_all(s2c::LEVEL_CHUNK_WITH_LIGHT, cpkt);
+                                }
                                 // Drop any items stored inside broken Chest or Furnace block entities!
                                 for stored in state.world.drain_broken_block_entity((bx, by, bz)) {
                                     let drop_eid =
@@ -2130,6 +2235,40 @@ async fn handle_play(
                                 )
                                 .await?;
                                 continue;
+                            } else if clicked_name == "minecraft:red_bed" {
+                                let bed_pos = [
+                                    use_pkt.pos.0 as f64 + 0.5,
+                                    use_pkt.pos.1 as f64 + 1.0,
+                                    use_pkt.pos.2 as f64 + 0.5,
+                                ];
+                                state.world.mutate_player(entity_id, |p| {
+                                    p.bed_spawn = Some(bed_pos);
+                                });
+                                let (_, cur_day) = state.world.clock_snapshot();
+                                if cur_day >= 12_500 {
+                                    let (gt, dt) = state.world.set_day_time(1_000);
+                                    state.world.set_raining(false);
+                                    state.world.broadcast_all(
+                                        s2c::SET_TIME,
+                                        encode_set_time_26_3(gt, dt, 1.0),
+                                    );
+                                    state
+                                        .world
+                                        .broadcast_all(s2c::GAME_EVENT, encode_game_event(2, 0.0));
+                                    send_chat(
+                                        conn,
+                                        "[Bed] Respawn point set & slept through the night until morning!",
+                                    )
+                                    .await?;
+                                } else {
+                                    send_chat(conn, "[Bed] Respawn point set!").await?;
+                                }
+                                conn.send_packet(
+                                    s2c::BLOCK_CHANGED_ACK,
+                                    &encode_block_changed_ack(use_pkt.sequence),
+                                )
+                                .await?;
+                                continue;
                             } else if clicked_name == "minecraft:oak_door"
                                 && (7243..=7306).contains(&clicked_state)
                             {
@@ -2201,6 +2340,17 @@ async fn handle_play(
                                         s2c::BLOCK_UPDATE,
                                         encode_block_update(tx, ty, tz, placed_state),
                                     );
+                                    if sky_world::lighting::block_emission(placed_state) > 0
+                                        && let Some(cpkt) =
+                                            state.world.reencode_chunk_packet(ChunkPos {
+                                                x: tx.div_euclid(16),
+                                                z: tz.div_euclid(16),
+                                            })
+                                    {
+                                        state
+                                            .world
+                                            .broadcast_all(s2c::LEVEL_CHUNK_WITH_LIGHT, cpkt);
+                                    }
                                     if game_mode == GameMode::Survival
                                         && let Some(Some(after)) =
                                             state.world.mutate_player(entity_id, |p| {

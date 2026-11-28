@@ -90,6 +90,7 @@ impl ItemStack {
         }
         match self.item_id {
             item_id::APPLE => Some((4, 2.4)),
+            item_id::GOLDEN_APPLE => Some((4, 9.6)),
             item_id::BREAD => Some((5, 6.0)),
             item_id::PORKCHOP => Some((3, 1.8)),
             item_id::COOKED_PORKCHOP => Some((8, 12.8)),

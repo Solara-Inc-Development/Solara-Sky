@@ -2,6 +2,7 @@ use sky_api::{CommandEvent, SkyPlugin};
 use sky_block_entity::{COOK_DURATION_TICKS, ChestBlockEntity, FurnaceBlockEntity};
 use sky_command::complete_command_input;
 use sky_data::{generated_entities, generated_items};
+use sky_effects::{PlayerEffects, effect_id_from_name};
 use sky_entity::{MobKind, PlayerVitals, WorldMob, block_survival_drop};
 use sky_inventory::{ItemStack, PlayerInventory};
 use sky_projectile::WorldArrow;
@@ -123,4 +124,14 @@ fn cross_crate_survival_crafting_ores_lua_and_worldgen_integration() {
     let mut arrow = WorldArrow::from_aim(900, 1, [0.0, -56.38, 0.0], 0.0, 0.0);
     arrow.step_flight();
     assert!(arrow.intersects_target([0.0, -58.0, 1.8], 0.4, 1.8));
+
+    // Phase 10: Status potion effects, Golden Apple / Bed / Shield recipes, and Torch block light (14)
+    let mut fx = PlayerEffects::new();
+    fx.apply(effect_id_from_name("strength").unwrap(), 0, 200);
+    assert!((fx.melee_damage_bonus() - 3.0).abs() < 1e-5);
+    assert!(sky_inventory::recipes::find_recipe("golden_apple").is_some());
+    assert!(sky_inventory::recipes::find_recipe("shield").is_some());
+    assert!(sky_inventory::recipes::find_recipe("red_bed").is_some());
+    let torch_st = sky_world::generated_blocks::default_state_by_name("minecraft:torch").unwrap();
+    assert_eq!(sky_world::lighting::block_emission(torch_st), 14);
 }

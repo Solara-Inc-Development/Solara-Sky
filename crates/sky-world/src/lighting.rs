@@ -72,15 +72,31 @@ fn light_opacity(state_id: u32) -> u8 {
         1
     } else if state_id == generated_blocks::default_state::WATER {
         2
+    } else if let Some(b) = generated_blocks::block_by_state_id(state_id)
+        && matches!(
+            b.name,
+            "minecraft:torch"
+                | "minecraft:ladder"
+                | "minecraft:oak_door"
+                | "minecraft:red_bed"
+                | "minecraft:birch_leaves"
+                | "minecraft:spruce_leaves"
+        )
+    {
+        u8::from(b.name.ends_with("_leaves"))
     } else {
         15
     }
 }
 
 #[inline]
-fn block_emission(state_id: u32) -> u8 {
+pub fn block_emission(state_id: u32) -> u8 {
     if state_id == generated_blocks::default_state::GLOWSTONE {
         15
+    } else if generated_blocks::block_by_state_id(state_id)
+        .is_some_and(|b| b.name == "minecraft:torch")
+    {
+        14
     } else {
         0
     }

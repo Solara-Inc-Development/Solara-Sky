@@ -6,6 +6,7 @@ members = [
     "crates/sky-world",
     "crates/sky-inventory",
     "crates/sky-block-entity",
+    "crates/sky-effects",
     "crates/sky-entity",
     "crates/sky-projectile",
     "crates/sky-command",
@@ -20,7 +21,7 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Solara-Inc-Development/Solara-Sky"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 aes = "0.8"
@@ -53,6 +54,7 @@ sky-protocol = { path = "crates/sky-protocol" }
 sky-world = { path = "crates/sky-world" }
 sky-inventory = { path = "crates/sky-inventory" }
 sky-block-entity = { path = "crates/sky-block-entity" }
+sky-effects = { path = "crates/sky-effects" }
 sky-entity = { path = "crates/sky-entity" }
 sky-projectile = { path = "crates/sky-projectile" }
 sky-command = { path = "crates/sky-command" }

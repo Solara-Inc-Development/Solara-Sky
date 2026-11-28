@@ -17,6 +17,7 @@ pub const COOK_DURATION_TICKS: u16 = 60; // Fast 3s responsive Survival smelting
 pub const fn smelt_output_for(input_item_id: u32) -> Option<u32> {
     match input_item_id {
         item_id::RAW_IRON => Some(item_id::IRON_INGOT),
+        item_id::RAW_GOLD => Some(item_id::GOLD_INGOT),
         item_id::SAND => Some(item_id::GLASS),
         item_id::COBBLESTONE => Some(item_id::STONE),
         item_id::BEEF => Some(item_id::COOKED_BEEF),

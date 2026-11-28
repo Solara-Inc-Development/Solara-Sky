@@ -161,6 +161,36 @@ pub static CORE_RECIPES: &[SimpleRecipe] = &[
         input_b: None,
         output: ItemStack::new(item_id::DIAMOND_CHESTPLATE, 1),
     },
+    SimpleRecipe {
+        name: "diamond_helmet",
+        input_a: (item_id::DIAMOND, 5),
+        input_b: None,
+        output: ItemStack::new(item_id::DIAMOND_HELMET, 1),
+    },
+    SimpleRecipe {
+        name: "gold_ingot",
+        input_a: (item_id::RAW_GOLD, 1),
+        input_b: Some((item_id::COAL, 1)),
+        output: ItemStack::new(item_id::GOLD_INGOT, 1),
+    },
+    SimpleRecipe {
+        name: "golden_apple",
+        input_a: (item_id::APPLE, 1),
+        input_b: Some((item_id::GOLD_INGOT, 8)),
+        output: ItemStack::new(item_id::GOLDEN_APPLE, 1),
+    },
+    SimpleRecipe {
+        name: "shield",
+        input_a: (item_id::OAK_PLANKS, 6),
+        input_b: Some((item_id::IRON_INGOT, 1)),
+        output: ItemStack::new(item_id::SHIELD, 1),
+    },
+    SimpleRecipe {
+        name: "red_bed",
+        input_a: (item_id::WHITE_WOOL, 3),
+        input_b: Some((item_id::OAK_PLANKS, 3)),
+        output: ItemStack::new(item_id::RED_BED, 1),
+    },
 ];
 
 pub fn find_recipe(name: &str) -> Option<&'static SimpleRecipe> {

@@ -1458,6 +1458,13 @@ name = "sky-data"
 version = "0.1.0-alpha.1"
 
 [[package]]
+name = "sky-effects"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-data",
+]
+
+[[package]]
 name = "sky-entity"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -1526,6 +1533,7 @@ dependencies = [
  "sky-block-entity",
  "sky-command",
  "sky-data",
+ "sky-effects",
  "sky-entity",
  "sky-inventory",
  "sky-projectile",

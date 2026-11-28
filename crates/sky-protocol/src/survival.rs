@@ -26,6 +26,32 @@ pub fn encode_set_experience(progress: f32, level: i32, total_xp: i32) -> Vec<u8
     w.into_inner()
 }
 
+/// Encodes bytecode-verified MC `26.3` `ClientboundUpdateMobEffectPacket` (`s2c::UPDATE_MOB_EFFECT = 0x87`):
+/// `(entityId: VarInt, effect: holderRegistry VarInt 0-based, amplifier: VarInt, durationTicks: VarInt, flags: u8)`.
+pub fn encode_update_mob_effect(
+    entity_id: i32,
+    effect_id: u32,
+    amplifier: u8,
+    duration_ticks: i32,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(20);
+    w.write_varint(entity_id);
+    w.write_varint(effect_id as i32);
+    w.write_varint(i32::from(amplifier));
+    w.write_varint(duration_ticks.max(0));
+    w.write_u8(0x06); // FLAG_VISIBLE (0x02) | FLAG_SHOW_ICON (0x04)
+    w.into_inner()
+}
+
+/// Encodes bytecode-verified MC `26.3` `ClientboundRemoveMobEffectPacket` (`s2c::REMOVE_MOB_EFFECT = 0x4F`):
+/// `(entityId: VarInt, effect: holderRegistry VarInt 0-based)`.
+pub fn encode_remove_mob_effect(entity_id: i32, effect_id: u32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(10);
+    w.write_varint(entity_id);
+    w.write_varint(effect_id as i32);
+    w.into_inner()
+}
+
 /// Encodes `ClientboundHurtAnimationPacket` (`id: VarInt, yaw: f32`).
 pub fn encode_hurt_animation(entity_id: i32, hurt_yaw_deg: f32) -> Vec<u8> {
     let mut w = PacketWriter::with_capacity(10);

@@ -8,7 +8,7 @@ use sky_protocol::config_play::{encode_block_update, encode_system_chat};
 use sky_protocol::entities::{encode_add_entity, encode_remove_entities, encode_teleport_entity};
 use sky_protocol::generated_packets;
 use sky_protocol::survival::{
-    encode_hurt_animation, encode_set_experience, encode_set_health,
+    encode_hurt_animation, encode_remove_mob_effect, encode_set_experience, encode_set_health,
     encode_set_player_inventory_slot, encode_set_time_26_3, encode_take_item_entity,
 };
 use sky_world::terrain::worker_threads;
@@ -323,6 +323,13 @@ pub fn run_parallel_region_tick(
             pid,
             generated_packets::play::clientbound::SET_EXPERIENCE,
             encode_set_experience(vitals.xp_progress, vitals.xp_level, vitals.total_xp),
+        );
+    }
+    for (pid, effect_id) in outcome.expired_effects {
+        state.world.send_direct(
+            pid,
+            generated_packets::play::clientbound::REMOVE_MOB_EFFECT,
+            encode_remove_mob_effect(pid, effect_id),
         );
     }
     for (victim, hurt_yaw) in outcome.zombie_hits {
