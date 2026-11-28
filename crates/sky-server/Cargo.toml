@@ -24,6 +24,7 @@ sky-command.workspace = true
 sky-data.workspace = true
 sky-entity.workspace = true
 sky-inventory.workspace = true
+sky-projectile.workspace = true
 sky-protocol.workspace = true
 sky-scripting.workspace = true
 sky-world.workspace = true

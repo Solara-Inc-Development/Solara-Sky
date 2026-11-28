@@ -45,11 +45,13 @@ impl PlayerInventory {
             ItemStack::new(item_id::GLOWSTONE, 64),
         ];
         inv.main[..HOTBAR_SLOTS].copy_from_slice(&starter_hotbar);
-        // Survival adventure supplies in backpack slots 9..13
+        // Survival adventure supplies in backpack slots 9..15
         inv.main[9] = ItemStack::new(item_id::WOODEN_PICKAXE, 1);
         inv.main[10] = ItemStack::new(item_id::WOODEN_SWORD, 1);
         inv.main[11] = ItemStack::new(item_id::BREAD, 8);
         inv.main[12] = ItemStack::new(item_id::TORCH, 16);
+        inv.main[13] = ItemStack::new(item_id::BOW, 1);
+        inv.main[14] = ItemStack::new(item_id::ARROW, 16);
         inv
     }
 
@@ -163,5 +165,22 @@ impl PlayerInventory {
         self.main.fill(ItemStack::EMPTY);
         self.armor.fill(ItemStack::EMPTY);
         self.offhand = ItemStack::EMPTY;
+    }
+
+    /// Equips a wearable armor item into `self.armor[0..4]`, returning `(armor_slot_idx, previous_piece)`.
+    pub fn equip_armor(&mut self, piece: ItemStack) -> Option<(usize, ItemStack)> {
+        let (armor_idx, _) = piece.armor_slot_and_defense()?;
+        let prev = self.armor[armor_idx];
+        self.armor[armor_idx] = ItemStack::new(piece.item_id, 1);
+        Some((armor_idx, prev))
+    }
+
+    /// Total equipped armor defense points (`0..=20`).
+    pub fn total_armor_points(&self) -> u8 {
+        self.armor
+            .iter()
+            .filter_map(|s| s.armor_slot_and_defense().map(|(_, pts)| pts))
+            .sum::<u8>()
+            .min(20)
     }
 }

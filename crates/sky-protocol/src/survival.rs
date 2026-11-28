@@ -16,6 +16,16 @@ pub fn encode_set_health(health: f32, food: i32, saturation: f32) -> Vec<u8> {
     w.into_inner()
 }
 
+/// Encodes bytecode-verified MC `26.3` `ClientboundSetExperiencePacket` (`s2c::SET_EXPERIENCE = 0x69`):
+/// wire order: `(experienceProgress: f32, experienceLevel: VarInt, totalExperience: VarInt)`.
+pub fn encode_set_experience(progress: f32, level: i32, total_xp: i32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(14);
+    w.write_f32(progress.clamp(0.0, 1.0));
+    w.write_varint(level.max(0));
+    w.write_varint(total_xp.max(0));
+    w.into_inner()
+}
+
 /// Encodes `ClientboundHurtAnimationPacket` (`id: VarInt, yaw: f32`).
 pub fn encode_hurt_animation(entity_id: i32, hurt_yaw_deg: f32) -> Vec<u8> {
     let mut w = PacketWriter::with_capacity(10);
@@ -103,11 +113,16 @@ pub fn encode_take_item_entity(
 }
 
 /// Decodes `ServerboundUseItemPacket` (`c2s::USE_ITEM = 0x43`): `(hand: VarInt, sequence: VarInt, yRot: f32, xRot: f32)`.
-pub fn decode_use_item(r: &mut PacketReader<'_>) -> ProtocolResult<(i32, i32)> {
+pub fn decode_use_item_rot(r: &mut PacketReader<'_>) -> ProtocolResult<(i32, i32, f32, f32)> {
     let hand = r.read_varint()?;
     let seq = r.read_varint()?;
-    let _y_rot = r.read_f32()?;
-    let _x_rot = r.read_f32()?;
+    let y_rot = r.read_f32()?;
+    let x_rot = r.read_f32()?;
+    Ok((hand, seq, y_rot, x_rot))
+}
+
+pub fn decode_use_item(r: &mut PacketReader<'_>) -> ProtocolResult<(i32, i32)> {
+    let (hand, seq, _, _) = decode_use_item_rot(r)?;
     Ok((hand, seq))
 }
 

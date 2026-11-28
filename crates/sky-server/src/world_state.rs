@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use sky_block_entity::{ChestBlockEntity, FurnaceBlockEntity};
 use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, WorldMob, compute_melee_knockback};
 use sky_inventory::{ItemStack, PlayerInventory};
+use sky_projectile::WorldArrow;
 use sky_protocol::config_play::GameMode;
 use sky_protocol::packets::ProfileProperty;
 use sky_world::anvil::{AnvilRegion, region_coords, region_file_path};
@@ -55,6 +56,9 @@ pub struct ConnectedPlayer {
 #[derive(Debug, Default)]
 pub struct WorldTickOutcome {
     pub moved_mobs: Vec<WorldMob>,
+    pub moved_arrows: Vec<WorldArrow>,
+    pub arrow_hit_mobs: Vec<(WorldMob, f32, bool)>,
+    pub xp_updates: Vec<(i32, PlayerVitals)>,
     pub healed_players: Vec<(i32, PlayerVitals)>,
     pub zombie_hits: Vec<(ConnectedPlayer, f32)>,
     pub picked_up_items: Vec<(i32, i32, u8, PlayerInventory)>,
@@ -62,7 +66,7 @@ pub struct WorldTickOutcome {
 }
 
 /// Thread-safe multi-core procedural Overworld chunk store, zero-copy `Bytes` packet cache,
-/// survival player roster, world mobs, floating item drops, Overworld clock, and Anvil persistence.
+/// survival player roster, world mobs, 3D arrows, floating item drops, Overworld clock, and Anvil persistence.
 pub struct LiveWorld {
     region_dir: PathBuf,
     generator: TerrainGenerator,
@@ -71,6 +75,7 @@ pub struct LiveWorld {
     dirty_chunks: RwLock<HashSet<ChunkPos>>,
     players: RwLock<HashMap<i32, ConnectedPlayer>>,
     mobs: RwLock<HashMap<i32, WorldMob>>,
+    arrows: RwLock<HashMap<i32, WorldArrow>>,
     item_drops: RwLock<HashMap<i32, WorldItemDrop>>,
     chests: RwLock<HashMap<(i32, i32, i32), ChestBlockEntity>>,
     furnaces: RwLock<HashMap<(i32, i32, i32), FurnaceBlockEntity>>,
@@ -168,6 +173,7 @@ impl LiveWorld {
             dirty_chunks: RwLock::new(HashSet::new()),
             players: RwLock::new(HashMap::new()),
             mobs: RwLock::new(initial_mobs),
+            arrows: RwLock::new(HashMap::new()),
             item_drops: RwLock::new(HashMap::new()),
             chests: RwLock::new(HashMap::new()),
             furnaces: RwLock::new(HashMap::new()),
@@ -475,6 +481,38 @@ impl LiveWorld {
             .collect()
     }
 
+    pub fn snapshot_arrows(&self) -> Vec<WorldArrow> {
+        self.arrows
+            .read()
+            .expect("arrows lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn spawn_arrow(
+        &self,
+        entity_id: i32,
+        shooter_entity_id: i32,
+        eye_pos: [f64; 3],
+        yaw_deg: f32,
+        pitch_deg: f32,
+    ) -> WorldArrow {
+        let arrow = WorldArrow::from_aim(entity_id, shooter_entity_id, eye_pos, yaw_deg, pitch_deg);
+        self.arrows
+            .write()
+            .expect("arrows lock")
+            .insert(entity_id, arrow.clone());
+        arrow
+    }
+
+    pub fn grant_player_xp(&self, entity_id: i32, points: i32) -> Option<(PlayerVitals, bool)> {
+        let mut pguard = self.players.write().expect("players lock");
+        let p = pguard.get_mut(&entity_id)?;
+        let leveled = p.vitals.add_experience(points);
+        Some((p.vitals, leveled))
+    }
+
     pub fn spawn_mob(&self, entity_id: i32, kind: MobKind, pos: [f64; 3]) -> WorldMob {
         let mob = WorldMob::new(entity_id, kind, pos);
         self.mobs
@@ -534,8 +572,28 @@ impl LiveWorld {
         p.position = pos;
         p.yaw_deg = yaw;
         p.pitch_deg = pitch;
+        let on_ladder = generated_blocks::block_by_state_id(self.get_block(
+            pos[0].floor() as i32,
+            pos[1].floor() as i32,
+            pos[2].floor() as i32,
+        ))
+        .is_some_and(|b| b.name == "minecraft:ladder");
+        if on_ladder {
+            p.vitals.fall_distance = 0.0;
+            p.vitals.last_y = pos[1];
+            return None;
+        }
         let vulnerable = matches!(p.game_mode, GameMode::Survival | GameMode::Adventure);
-        let dmg = p.vitals.update_movement(pos[1], on_ground, vulnerable);
+        let armor_pts = p.inventory.total_armor_points();
+        let dmg = if armor_pts > 0 && on_ground && p.vitals.fall_distance > 3.25 && vulnerable {
+            let dist = p.vitals.fall_distance;
+            p.vitals.fall_distance = 0.0;
+            p.vitals.last_y = pos[1];
+            p.vitals
+                .apply_damage_with_armor((dist - 3.0).ceil(), armor_pts / 2)
+        } else {
+            p.vitals.update_movement(pos[1], on_ground, vulnerable)
+        };
         (dmg > 0.0).then_some((p.vitals, dmg))
     }
 
@@ -587,7 +645,8 @@ impl LiveWorld {
         if matches!(victim.game_mode, GameMode::Creative | GameMode::Spectator) {
             return None;
         }
-        let dealt = victim.vitals.apply_damage(damage);
+        let armor_pts = victim.inventory.total_armor_points();
+        let dealt = victim.vitals.apply_damage_with_armor(damage, armor_pts);
         if dealt <= 0.0 {
             return None;
         }
@@ -655,13 +714,14 @@ impl LiveWorld {
         {
             let mut pguard = self.players.write().expect("players lock");
             for (pid, mpos, dmg) in pending_hostile_strikes {
-                if let Some(victim) = pguard.get_mut(&pid)
-                    && victim.vitals.apply_damage(dmg) > 0.0
-                {
-                    let (kb, hurt_yaw) = compute_melee_knockback(mpos, victim.position, 0.35);
-                    victim.position[0] += kb[0];
-                    victim.position[2] += kb[2];
-                    out.zombie_hits.push((victim.clone(), hurt_yaw));
+                if let Some(victim) = pguard.get_mut(&pid) {
+                    let armor_pts = victim.inventory.total_armor_points();
+                    if victim.vitals.apply_damage_with_armor(dmg, armor_pts) > 0.0 {
+                        let (kb, hurt_yaw) = compute_melee_knockback(mpos, victim.position, 0.35);
+                        victim.position[0] += kb[0];
+                        victim.position[2] += kb[2];
+                        out.zombie_hits.push((victim.clone(), hurt_yaw));
+                    }
                 }
             }
             for p in pguard.values_mut() {
@@ -669,8 +729,99 @@ impl LiveWorld {
                     out.healed_players.push((p.entity_id, p.vitals));
                 }
             }
+        }
 
-            // Auto-pickup nearby floating item drops within 2.0 blocks!
+        // Step active 3D arrows (ballistic flight, block impact, mob/PvP hits, and shooter XP!)
+        {
+            let mut aguard = self.arrows.write().expect("arrows lock");
+            let arrow_ids: Vec<i32> = aguard.keys().copied().collect();
+            for aid in arrow_ids {
+                let Some(mut arrow) = aguard.get(&aid).cloned() else {
+                    continue;
+                };
+                arrow.step_flight();
+                if arrow.is_expired() {
+                    aguard.remove(&aid);
+                    out.despawned_items.push(aid);
+                    continue;
+                }
+
+                // Solid terrain impact check
+                let st = self.get_block(
+                    arrow.position[0].floor() as i32,
+                    arrow.position[1].floor() as i32,
+                    arrow.position[2].floor() as i32,
+                );
+                let passable = st == generated_blocks::default_state::AIR
+                    || st == generated_blocks::default_state::WATER
+                    || ((7243..=7306).contains(&st) && (((st - 7243) / 2) & 1) == 0)
+                    || generated_blocks::block_by_state_id(st)
+                        .is_some_and(|b| matches!(b.name, "minecraft:ladder" | "minecraft:torch"));
+                if !passable {
+                    aguard.remove(&aid);
+                    out.despawned_items.push(aid);
+                    continue;
+                }
+
+                // Check Overworld mob hit
+                let hit_mob_id = {
+                    let mguard = self.mobs.read().expect("mobs lock");
+                    mguard
+                        .values()
+                        .find(|m| arrow.intersects_target(m.position, 0.42, 1.85))
+                        .map(|m| m.entity_id)
+                };
+                if let Some(mid) = hit_mob_id {
+                    aguard.remove(&aid);
+                    out.despawned_items.push(aid);
+                    if let Some((mob_snap, hyaw, died)) =
+                        self.attack_mob(mid, arrow.prev_position, WorldArrow::BASE_DAMAGE)
+                    {
+                        if died
+                            && let Some((v, _)) = self.grant_player_xp(
+                                arrow.shooter_entity_id,
+                                if mob_snap.kind.is_hostile() { 12 } else { 6 },
+                            )
+                        {
+                            out.xp_updates.push((arrow.shooter_entity_id, v));
+                        }
+                        out.arrow_hit_mobs.push((mob_snap, hyaw, died));
+                    }
+                    continue;
+                }
+
+                // Check PvP player hit
+                let hit_pid = {
+                    let pguard = self.players.read().expect("players lock");
+                    pguard
+                        .values()
+                        .find(|p| {
+                            p.entity_id != arrow.shooter_entity_id
+                                && matches!(p.game_mode, GameMode::Survival | GameMode::Adventure)
+                                && !p.vitals.is_dead()
+                                && arrow.intersects_target(p.position, 0.35, 1.8)
+                        })
+                        .map(|p| p.entity_id)
+                };
+                if let Some(pid) = hit_pid {
+                    aguard.remove(&aid);
+                    out.despawned_items.push(aid);
+                    if let Some((victim, _, hyaw)) =
+                        self.attack_player(pid, arrow.prev_position, WorldArrow::BASE_DAMAGE)
+                    {
+                        out.zombie_hits.push((victim, hyaw));
+                    }
+                    continue;
+                }
+
+                out.moved_arrows.push(arrow.clone());
+                aguard.insert(aid, arrow);
+            }
+        }
+
+        // Auto-pickup nearby floating item drops within 2.0 blocks!
+        {
+            let mut pguard = self.players.write().expect("players lock");
             let mut dguard = self.item_drops.write().expect("item_drops lock");
             let drop_ids: Vec<i32> = dguard.keys().copied().collect();
             for drop_id in drop_ids {

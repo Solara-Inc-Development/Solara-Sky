@@ -1442,6 +1442,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-block-entity"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-data",
+ "sky-inventory",
+]
+
+[[package]]
 name = "sky-command"
 version = "0.1.0-alpha.1"
 
@@ -1465,11 +1473,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-projectile"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-data",
+ "uuid",
+]
+
+[[package]]
 name = "sky-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [
  "aes",
- "bytes",
  "cfb8",
  "cipher",
  "flate2",
@@ -1481,7 +1496,6 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
- "tokio",
  "uuid",
 ]
 
@@ -1509,10 +1523,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sky-api",
+ "sky-block-entity",
  "sky-command",
  "sky-data",
  "sky-entity",
  "sky-inventory",
+ "sky-projectile",
  "sky-protocol",
  "sky-scripting",
  "sky-world",

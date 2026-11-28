@@ -2,7 +2,7 @@
 
 A fast, lightweight, open-source **Minecraft: Java Edition** server written in native Rust, built for low latency, low memory usage, and zero garbage-collection stalls.
 
-> **Status:** Active development (Phases 0–7 playable core complete: MC `26.3` login/auth, Velocity/BungeeCord forwarding, Folia-style `rayon` multi-core regionized ticking, TPS/MSPT profiler, `sky-api` + `.lua` `sky-scripting` plugins, procedural Overworld terrain/caves/ores, Sky/Block lighting, floating item drops & auto-pickup, 16 survival crafting recipes, food & PvP/mob combat, MC `26.3` `WorldClock` day/night cycle & async Anvil `.mca` persistence).
+> **Status:** Active development (Phases 0–9 playable core complete across **12 modular crates**: MC `26.3` login/auth, Velocity/BungeeCord forwarding, Folia-style `rayon` multi-core regionized ticking, TPS/MSPT profiler, `sky-api` + `.lua` `sky-scripting` plugins, 5-biome Overworld terrain/structures/ores, Sky/Block lighting, Chest & Furnace block entities, 8 Overworld mobs, 3D Bow/Arrow projectiles, Armor defense & XP levels, 25 survival crafting recipes, interactive Doors/Ladders, weather & async Anvil `.mca` persistence).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux
 
@@ -19,9 +19,10 @@ A fast, lightweight, open-source **Minecraft: Java Edition** server written in n
 - `crates/sky-data` — Generated MC `26.3` (`777`) items (`1,658`), entity types (`161`), sound events (`1,991`), particles (`128`), and mob effects (`40`)
 - `crates/sky-protocol` — MC `26.3` (`777`) protocol primitives (`VarInt`, NBT, compression, AES-128-CFB8 crypto, packets, survival/combat codecs, Velocity/BungeeCord forwarding)
 - `crates/sky-world` — Bit-packed paletted chunk storage, `rayon` multi-core terrain/cave/tree generator, 24-section Sky/Block lighting, and async Anvil (`.mca`) persistence
-- `crates/sky-inventory` — `ItemStack`, 36-slot `PlayerInventory`, and 16 core crafting recipes
+- `crates/sky-inventory` — `ItemStack`, 36-slot `PlayerInventory` + 4 Armor slots, and 25 core crafting recipes
 - `crates/sky-block-entity` — Persistent 27-slot `ChestBlockEntity` storage and Folia-ticked `FurnaceBlockEntity` ore/food smelting
-- `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, fall damage, regen), melee PvP/PvE knockback, floating `WorldItemDrop` loot, and 8-species `WorldMob` AI (`Pig`, `Cow`, `Sheep`, `Chicken`, `Zombie`, `Skeleton`, `Spider`, `Creeper`)
+- `crates/sky-entity` — Survival `PlayerVitals` (health, hunger, armor mitigation, XP levels, fall damage, regen), melee knockback, floating `WorldItemDrop` loot, and 8-species `WorldMob` AI
+- `crates/sky-projectile` — Ballistic 3D `WorldArrow` projectiles (`minecraft:arrow`) with swept AABB mob/PvP hit detection and shooter XP rewards
 - `crates/sky-command` — Brigadier-style command catalog and `Tab` auto-completion engine
 - `crates/sky-api` — Native Rust server plugin & event SDK (`SkyPlugin`)
 - `crates/sky-scripting` — Lightweight `.lua` plugin loader (`plugins/*.lua`) for custom commands, MOTD overrides, and chat filters without recompiling Rust

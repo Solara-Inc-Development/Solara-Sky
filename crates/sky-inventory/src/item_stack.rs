@@ -54,7 +54,9 @@ impl ItemStack {
                     || k.ends_with("_helmet")
                     || k.ends_with("_chestplate")
                     || k.ends_with("_leggings")
-                    || k.ends_with("_boots") =>
+                    || k.ends_with("_boots")
+                    || k == "minecraft:bow"
+                    || k == "minecraft:shield" =>
             {
                 1
             }
@@ -94,6 +96,28 @@ impl ItemStack {
             item_id::BEEF => Some((3, 1.8)),
             item_id::COOKED_BEEF => Some((8, 12.8)),
             item_id::ROTTEN_FLESH => Some((4, 0.8)),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some((armor_slot_idx, defense_points))` for wearable armor (`0=Boots, 1=Leggings, 2=Chestplate, 3=Helmet`).
+    pub const fn armor_slot_and_defense(&self) -> Option<(usize, u8)> {
+        if self.is_empty() {
+            return None;
+        }
+        match self.item_id {
+            item_id::LEATHER_BOOTS => Some((0, 1)),
+            item_id::LEATHER_LEGGINGS => Some((1, 2)),
+            item_id::LEATHER_CHESTPLATE => Some((2, 3)),
+            item_id::LEATHER_HELMET => Some((3, 1)),
+            item_id::IRON_BOOTS => Some((0, 2)),
+            item_id::IRON_LEGGINGS => Some((1, 5)),
+            item_id::IRON_CHESTPLATE => Some((2, 6)),
+            item_id::IRON_HELMET => Some((3, 2)),
+            item_id::DIAMOND_BOOTS => Some((0, 3)),
+            item_id::DIAMOND_LEGGINGS => Some((1, 6)),
+            item_id::DIAMOND_CHESTPLATE => Some((2, 8)),
+            item_id::DIAMOND_HELMET => Some((3, 3)),
             _ => None,
         }
     }

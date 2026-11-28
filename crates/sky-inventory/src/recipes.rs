@@ -107,6 +107,60 @@ pub static CORE_RECIPES: &[SimpleRecipe] = &[
         input_b: Some((item_id::COAL, 1)),
         output: ItemStack::new(item_id::COOKED_BEEF, 1),
     },
+    SimpleRecipe {
+        name: "bow",
+        input_a: (item_id::STICK, 3),
+        input_b: Some((item_id::STRING, 3)),
+        output: ItemStack::new(item_id::BOW, 1),
+    },
+    SimpleRecipe {
+        name: "arrow",
+        input_a: (item_id::COBBLESTONE, 1),
+        input_b: Some((item_id::STICK, 1)),
+        output: ItemStack::new(item_id::ARROW, 4),
+    },
+    SimpleRecipe {
+        name: "ladder",
+        input_a: (item_id::STICK, 7),
+        input_b: None,
+        output: ItemStack::new(item_id::LADDER, 3),
+    },
+    SimpleRecipe {
+        name: "oak_door",
+        input_a: (item_id::OAK_PLANKS, 6),
+        input_b: None,
+        output: ItemStack::new(item_id::OAK_DOOR, 3),
+    },
+    SimpleRecipe {
+        name: "iron_helmet",
+        input_a: (item_id::IRON_INGOT, 5),
+        input_b: None,
+        output: ItemStack::new(item_id::IRON_HELMET, 1),
+    },
+    SimpleRecipe {
+        name: "iron_chestplate",
+        input_a: (item_id::IRON_INGOT, 8),
+        input_b: None,
+        output: ItemStack::new(item_id::IRON_CHESTPLATE, 1),
+    },
+    SimpleRecipe {
+        name: "iron_leggings",
+        input_a: (item_id::IRON_INGOT, 7),
+        input_b: None,
+        output: ItemStack::new(item_id::IRON_LEGGINGS, 1),
+    },
+    SimpleRecipe {
+        name: "iron_boots",
+        input_a: (item_id::IRON_INGOT, 4),
+        input_b: None,
+        output: ItemStack::new(item_id::IRON_BOOTS, 1),
+    },
+    SimpleRecipe {
+        name: "diamond_chestplate",
+        input_a: (item_id::DIAMOND, 8),
+        input_b: None,
+        output: ItemStack::new(item_id::DIAMOND_CHESTPLATE, 1),
+    },
 ];
 
 pub fn find_recipe(name: &str) -> Option<&'static SimpleRecipe> {

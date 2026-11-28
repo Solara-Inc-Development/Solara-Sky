@@ -4,6 +4,7 @@ use sky_command::complete_command_input;
 use sky_data::{generated_entities, generated_items};
 use sky_entity::{MobKind, PlayerVitals, WorldMob, block_survival_drop};
 use sky_inventory::{ItemStack, PlayerInventory};
+use sky_projectile::WorldArrow;
 use sky_scripting::LuaScriptPlugin;
 use sky_world::ChunkPos;
 use sky_world::terrain::TerrainGenerator;
@@ -107,4 +108,19 @@ fn cross_crate_survival_crafting_ores_lua_and_worldgen_integration() {
 
     let (_, _, suggestions) = complete_command_input("/wea", false, &[]);
     assert!(suggestions.contains(&"weather".to_owned()));
+
+    // Phase 9: Armor equipping, damage mitigation, XP levels, and 3D Arrow projectiles
+    let chestplate = ItemStack::new(generated_items::id::DIAMOND_CHESTPLATE, 1);
+    assert_eq!(inv.equip_armor(chestplate).unwrap().0, 2);
+    assert_eq!(inv.total_armor_points(), 8);
+
+    let mut armored_vitals = PlayerVitals::new_full(-58.0);
+    let dealt = armored_vitals.apply_damage_with_armor(10.0, inv.total_armor_points());
+    assert!(dealt < 7.0, "8 armor points should mitigate 32% of damage");
+    assert!(armored_vitals.add_experience(20));
+    assert!(armored_vitals.xp_level >= 1);
+
+    let mut arrow = WorldArrow::from_aim(900, 1, [0.0, -56.38, 0.0], 0.0, 0.0);
+    arrow.step_flight();
+    assert!(arrow.intersects_target([0.0, -58.0, 1.8], 0.4, 1.8));
 }

@@ -12,9 +12,11 @@ use sky_api::{
     StatusPingEvent,
 };
 use sky_command::complete_command_input;
+use sky_data::generated_items::id as item_id;
 use sky_entity::{MobKind, PlayerVitals, WorldItemDrop, block_survival_drop};
 use sky_inventory::recipes::CORE_RECIPES;
 use sky_inventory::{ItemStack, PlayerInventory};
+use sky_projectile::WorldArrow;
 use sky_protocol::buf::{PacketReader, PacketWriter};
 use sky_protocol::config_play::{
     AcceptTeleportC2s, GAME_EVENT_CHANGE_GAME_MODE, GAME_EVENT_START_WAITING_CHUNKS, GameMode,
@@ -39,9 +41,9 @@ use sky_protocol::packets::{
 };
 use sky_protocol::survival::{
     CLIENT_CMD_PERFORM_RESPAWN, decode_attack_entity, decode_client_command,
-    decode_command_suggestion, decode_use_item, encode_animate, encode_command_suggestions,
-    encode_hurt_animation, encode_level_event, encode_respawn, encode_set_health,
-    encode_set_player_inventory_slot, encode_set_time_26_3,
+    decode_command_suggestion, decode_use_item_rot, encode_animate, encode_command_suggestions,
+    encode_hurt_animation, encode_level_event, encode_respawn, encode_set_experience,
+    encode_set_health, encode_set_player_inventory_slot, encode_set_time_26_3,
 };
 use sky_protocol::velocity::{
     VELOCITY_MAX_SUPPORTED_VERSION, VELOCITY_PLAYER_INFO_CHANNEL, verify_velocity_player_info,
@@ -718,6 +720,13 @@ async fn sync_player_inventory(conn: &mut FramedConnection, inv: &PlayerInventor
         )
         .await?;
     }
+    for (armor_idx, ast) in inv.armor.iter().enumerate() {
+        conn.send_packet(
+            s2c::SET_PLAYER_INVENTORY,
+            &encode_set_player_inventory_slot(36 + armor_idx, ast.item_id, ast.count),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -942,13 +951,37 @@ async fn execute_command(
                         format!("[{idx}] {}x {short}", s.count)
                     })
                     .collect();
+                let armor_pts = p.inventory.total_armor_points();
                 if items.is_empty() {
-                    "Inventory is empty.".to_owned()
+                    format!("Inventory is empty (Armor: {armor_pts}/20).")
                 } else {
-                    format!("Inventory: {}", items.join(", "))
+                    format!("Armor: {armor_pts}/20 | Inventory: {}", items.join(", "))
                 }
             }) {
                 send_chat(conn, &summary).await?;
+            }
+        }
+        "xp" | "experience" => {
+            let pts: i32 = parts
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15)
+                .clamp(1, 10_000);
+            if let Some((vitals, leveled)) = state.world.grant_player_xp(entity_id, pts) {
+                conn.send_packet(
+                    s2c::SET_EXPERIENCE,
+                    &encode_set_experience(vitals.xp_progress, vitals.xp_level, vitals.total_xp),
+                )
+                .await?;
+                let lvl_note = if leveled { " (LEVEL UP!)" } else { "" };
+                send_chat(
+                    conn,
+                    &format!(
+                        "Granted +{pts} XP -> Level {} (Total: {} XP){lvl_note}",
+                        vitals.xp_level, vitals.total_xp
+                    ),
+                )
+                .await?;
             }
         }
         "time" => {
@@ -1300,6 +1333,7 @@ async fn handle_play(
 
     let existing_players = state.world.snapshot_players();
     let existing_mobs = state.world.snapshot_mobs();
+    let existing_arrows = state.world.snapshot_arrows();
     let existing_drops = state.world.snapshot_item_drops();
     let mut broadcast_rx = state.world.subscribe();
 
@@ -1436,6 +1470,20 @@ async fn handle_play(
         )
         .await?;
     }
+    for arrow in &existing_arrows {
+        conn.send_packet(
+            s2c::ADD_ENTITY,
+            &encode_add_entity(
+                arrow.entity_id,
+                arrow.uuid,
+                WorldArrow::PROTOCOL_ENTITY_TYPE,
+                arrow.position,
+                arrow.yaw_deg,
+                arrow.pitch_deg,
+            ),
+        )
+        .await?;
+    }
 
     let (gt, dt) = state.world.clock_snapshot();
     conn.send_packet(s2c::SET_TIME, &encode_set_time_26_3(gt, dt, 1.0))
@@ -1449,6 +1497,8 @@ async fn handle_play(
     sync_player_inventory(conn, &starter_inv).await?;
 
     conn.send_packet(s2c::SET_HEALTH, &encode_set_health(20.0, 20, 5.0))
+        .await?;
+    conn.send_packet(s2c::SET_EXPERIENCE, &encode_set_experience(0.0, 0, 0))
         .await?;
 
     // Broadcast this new player's tab entry + visible 3D entity to all other online players!
@@ -1671,6 +1721,20 @@ async fn handle_play(
                                             0.0,
                                         ),
                                     );
+                                    let xp_gain = if mob.kind.is_hostile() { 12 } else { 5 };
+                                    if let Some((v, _)) =
+                                        state.world.grant_player_xp(entity_id, xp_gain)
+                                    {
+                                        conn.send_packet(
+                                            s2c::SET_EXPERIENCE,
+                                            &encode_set_experience(
+                                                v.xp_progress,
+                                                v.xp_level,
+                                                v.total_xp,
+                                            ),
+                                        )
+                                        .await?;
+                                    }
                                 } else {
                                     state.world.broadcast_all(
                                         s2c::TELEPORT_ENTITY,
@@ -1728,6 +1792,18 @@ async fn handle_play(
                                             false,
                                         ),
                                     );
+                                    if let Some((v, _)) = state.world.grant_player_xp(entity_id, 15)
+                                    {
+                                        conn.send_packet(
+                                            s2c::SET_EXPERIENCE,
+                                            &encode_set_experience(
+                                                v.xp_progress,
+                                                v.xp_level,
+                                                v.total_xp,
+                                            ),
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -1822,9 +1898,73 @@ async fn handle_play(
                     }
                     c2s::USE_ITEM => {
                         let mut r = PacketReader::new(&payload);
-                        let (hand, seq) = decode_use_item(&mut r)?;
-                        if hand == 0
-                            && let Some(Some((vitals, updated_slot))) =
+                        let (hand, seq, y_rot, x_rot) = decode_use_item_rot(&mut r)?;
+                        if hand == 0 {
+                            let held_now = state
+                                .world
+                                .mutate_player(entity_id, |p| p.inventory.main[held_slot])
+                                .unwrap_or(ItemStack::EMPTY);
+
+                            if held_now.item_id == item_id::BOW {
+                                let can_shoot = if game_mode == GameMode::Creative {
+                                    Some(None)
+                                } else {
+                                    state.world.mutate_player(entity_id, |p| {
+                                        p.inventory
+                                            .consume_item(item_id::ARROW, 1)
+                                            .then(|| p.inventory.clone())
+                                    }).flatten().map(Some)
+                                };
+                                if let Some(maybe_inv) = can_shoot {
+                                    let arrow_id =
+                                        state.next_entity_id.fetch_add(1, Ordering::Relaxed);
+                                    let eye = [player_pos[0], player_pos[1] + 1.62, player_pos[2]];
+                                    let arrow = state.world.spawn_arrow(
+                                        arrow_id,
+                                        entity_id,
+                                        eye,
+                                        y_rot,
+                                        x_rot,
+                                    );
+                                    state.world.broadcast_all(
+                                        s2c::ADD_ENTITY,
+                                        encode_add_entity(
+                                            arrow.entity_id,
+                                            arrow.uuid,
+                                            WorldArrow::PROTOCOL_ENTITY_TYPE,
+                                            arrow.position,
+                                            arrow.yaw_deg,
+                                            arrow.pitch_deg,
+                                        ),
+                                    );
+                                    if let Some(inv_after) = maybe_inv {
+                                        sync_player_inventory(conn, &inv_after).await?;
+                                    }
+                                }
+                            } else if held_now.armor_slot_and_defense().is_some() {
+                                if let Some(Some((armor_idx, inv_after, total_def))) =
+                                    state.world.mutate_player(entity_id, |p| {
+                                        let piece = p.inventory.main[held_slot];
+                                        let (a_idx, displaced) = p.inventory.equip_armor(piece)?;
+                                        p.inventory.main[held_slot] = displaced;
+                                        let def = p.inventory.total_armor_points();
+                                        Some((a_idx, p.inventory.clone(), def))
+                                    })
+                                {
+                                    sync_player_inventory(conn, &inv_after).await?;
+                                    send_chat(
+                                        conn,
+                                        &format!(
+                                            "[Armor] Equipped {} (slot #{armor_idx}, Defense: {total_def}/20).",
+                                            held_now
+                                                .key()
+                                                .unwrap_or("armor")
+                                                .trim_start_matches("minecraft:")
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                            } else if let Some(Some((vitals, updated_slot))) =
                                 state.world.mutate_player(entity_id, |p| {
                                     let held = p.inventory.main[held_slot];
                                     let (pts, sat) = held.food_nutrition()?;
@@ -1835,21 +1975,22 @@ async fn handle_play(
                                         None
                                     }
                                 })
-                        {
-                            conn.send_packet(
-                                s2c::SET_HEALTH,
-                                &encode_set_health(vitals.health, vitals.food, vitals.saturation),
-                            )
-                            .await?;
-                            conn.send_packet(
-                                s2c::SET_PLAYER_INVENTORY,
-                                &encode_set_player_inventory_slot(
-                                    held_slot,
-                                    updated_slot.item_id,
-                                    updated_slot.count,
-                                ),
-                            )
-                            .await?;
+                            {
+                                conn.send_packet(
+                                    s2c::SET_HEALTH,
+                                    &encode_set_health(vitals.health, vitals.food, vitals.saturation),
+                                )
+                                .await?;
+                                conn.send_packet(
+                                    s2c::SET_PLAYER_INVENTORY,
+                                    &encode_set_player_inventory_slot(
+                                        held_slot,
+                                        updated_slot.item_id,
+                                        updated_slot.count,
+                                    ),
+                                )
+                                .await?;
+                            }
                         }
                         conn.send_packet(s2c::BLOCK_CHANGED_ACK, &encode_block_changed_ack(seq))
                             .await?;
@@ -1931,6 +2072,20 @@ async fn handle_play(
                                             0.0,
                                         ),
                                     );
+                                    if br.name.ends_with("_ore")
+                                        && let Some((v, _)) =
+                                            state.world.grant_player_xp(entity_id, 5)
+                                    {
+                                        conn.send_packet(
+                                            s2c::SET_EXPERIENCE,
+                                            &encode_set_experience(
+                                                v.xp_progress,
+                                                v.xp_level,
+                                                v.total_xp,
+                                            ),
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -1968,6 +2123,37 @@ async fn handle_play(
                                 {
                                     sync_player_inventory(conn, &inv).await?;
                                     send_chat(conn, &msg).await?;
+                                }
+                                conn.send_packet(
+                                    s2c::BLOCK_CHANGED_ACK,
+                                    &encode_block_changed_ack(use_pkt.sequence),
+                                )
+                                .await?;
+                                continue;
+                            } else if clicked_name == "minecraft:oak_door"
+                                && (7243..=7306).contains(&clicked_state)
+                            {
+                                let is_open = (((clicked_state - 7243) / 2) & 1) == 0;
+                                let toggled = if is_open {
+                                    clicked_state + 2
+                                } else {
+                                    clicked_state - 2
+                                };
+                                if state.world.set_block(
+                                    use_pkt.pos.0,
+                                    use_pkt.pos.1,
+                                    use_pkt.pos.2,
+                                    toggled,
+                                ) {
+                                    state.world.broadcast_all(
+                                        s2c::BLOCK_UPDATE,
+                                        encode_block_update(
+                                            use_pkt.pos.0,
+                                            use_pkt.pos.1,
+                                            use_pkt.pos.2,
+                                            toggled,
+                                        ),
+                                    );
                                 }
                                 conn.send_packet(
                                     s2c::BLOCK_CHANGED_ACK,

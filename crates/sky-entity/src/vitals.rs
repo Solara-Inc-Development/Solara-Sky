@@ -1,7 +1,7 @@
 pub const MAX_HEALTH: f32 = 20.0;
 pub const MAX_FOOD: i32 = 20;
 
-/// Survival health, hunger, saturation, hurt invulnerability, and fall-damage state.
+/// Survival health, hunger, saturation, hurt invulnerability, fall-damage, and XP state.
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerVitals {
     pub health: f32,
@@ -10,11 +10,24 @@ pub struct PlayerVitals {
     pub fall_distance: f32,
     pub last_y: f64,
     pub hurt_invuln_ticks: u8,
+    pub total_xp: i32,
+    pub xp_level: i32,
+    pub xp_progress: f32,
 }
 
 impl Default for PlayerVitals {
     fn default() -> Self {
         Self::new_full(0.0)
+    }
+}
+
+pub const fn xp_needed_for_next_level(level: i32) -> i32 {
+    if level < 16 {
+        2 * level + 7
+    } else if level < 31 {
+        5 * level - 38
+    } else {
+        9 * level - 158
     }
 }
 
@@ -27,6 +40,9 @@ impl PlayerVitals {
             fall_distance: 0.0,
             last_y: spawn_y,
             hurt_invuln_ticks: 0,
+            total_xp: 0,
+            xp_level: 0,
+            xp_progress: 0.0,
         }
     }
 
@@ -59,13 +75,44 @@ impl PlayerVitals {
 
     /// Applies incoming damage if outside hurt-invulnerability frames; returns actual damage dealt.
     pub fn apply_damage(&mut self, amount: f32) -> f32 {
+        self.apply_damage_with_armor(amount, 0)
+    }
+
+    /// Applies incoming damage reduced by equipped `armor_points` (`4%` per armor point, up to `80%`).
+    pub fn apply_damage_with_armor(&mut self, amount: f32, armor_points: u8) -> f32 {
         if amount <= 0.0 || self.hurt_invuln_ticks > 0 || self.is_dead() {
             return 0.0;
         }
-        let dealt = amount.min(self.health);
-        self.health = (self.health - amount).max(0.0);
+        let reduction = (f32::from(armor_points.min(20)) * 0.04).clamp(0.0, 0.80);
+        let mitigated = (amount * (1.0 - reduction)).max(0.25);
+        let dealt = mitigated.min(self.health);
+        self.health = (self.health - mitigated).max(0.0);
         self.hurt_invuln_ticks = 10; // 0.5s (10 ticks) classic Minecraft hurt immunity
         dealt
+    }
+
+    /// Grants `amount` experience points, advancing `xp_level` and `xp_progress` (`0.0..1.0`).
+    /// Returns `true` if the player leveled up!
+    pub fn add_experience(&mut self, amount: i32) -> bool {
+        if amount <= 0 {
+            return false;
+        }
+        let prev_level = self.xp_level;
+        self.total_xp = self.total_xp.saturating_add(amount);
+        let mut rem = self.total_xp;
+        let mut lvl = 0i32;
+        loop {
+            let need = xp_needed_for_next_level(lvl).max(1);
+            if rem >= need {
+                rem -= need;
+                lvl += 1;
+            } else {
+                self.xp_level = lvl;
+                self.xp_progress = (rem as f32 / need as f32).clamp(0.0, 0.999);
+                break;
+            }
+        }
+        self.xp_level > prev_level
     }
 
     /// Updates fall distance on player movement and returns fall damage (`> 0.0`) when landing!

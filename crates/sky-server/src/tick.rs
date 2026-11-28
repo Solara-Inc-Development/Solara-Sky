@@ -5,11 +5,11 @@ use crate::net::SharedServerState;
 use rayon::prelude::*;
 use sky_api::RegionTickSummary;
 use sky_protocol::config_play::{encode_block_update, encode_system_chat};
-use sky_protocol::entities::{encode_remove_entities, encode_teleport_entity};
+use sky_protocol::entities::{encode_add_entity, encode_remove_entities, encode_teleport_entity};
 use sky_protocol::generated_packets;
 use sky_protocol::survival::{
-    encode_hurt_animation, encode_set_health, encode_set_player_inventory_slot,
-    encode_set_time_26_3, encode_take_item_entity,
+    encode_hurt_animation, encode_set_experience, encode_set_health,
+    encode_set_player_inventory_slot, encode_set_time_26_3, encode_take_item_entity,
 };
 use sky_world::terrain::worker_threads;
 use sky_world::{ChunkPos, OVERWORLD_MIN_Y, generated_blocks};
@@ -269,6 +269,60 @@ pub fn run_parallel_region_tick(
         state.world.broadcast_all(
             generated_packets::play::clientbound::TELEPORT_ENTITY,
             encode_teleport_entity(mob.entity_id, mob.position, mob.yaw_deg, 0.0, true),
+        );
+    }
+    for arrow in outcome.moved_arrows {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::TELEPORT_ENTITY,
+            encode_teleport_entity(
+                arrow.entity_id,
+                arrow.position,
+                arrow.yaw_deg,
+                arrow.pitch_deg,
+                false,
+            ),
+        );
+    }
+    for (mob, hurt_yaw, died) in outcome.arrow_hit_mobs {
+        state.world.broadcast_all(
+            generated_packets::play::clientbound::HURT_ANIMATION,
+            encode_hurt_animation(mob.entity_id, hurt_yaw),
+        );
+        if died {
+            state.world.broadcast_all(
+                generated_packets::play::clientbound::REMOVE_ENTITIES,
+                encode_remove_entities(&[mob.entity_id]),
+            );
+            let (loot_item, loot_cnt) = mob.kind.death_loot();
+            let drop_eid = state
+                .next_entity_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let drop = state
+                .world
+                .spawn_item_drop(drop_eid, loot_item, loot_cnt, mob.position);
+            state.world.broadcast_all(
+                generated_packets::play::clientbound::ADD_ENTITY,
+                encode_add_entity(
+                    drop.entity_id,
+                    drop.uuid,
+                    sky_entity::WorldItemDrop::PROTOCOL_ENTITY_TYPE,
+                    drop.position,
+                    0.0,
+                    0.0,
+                ),
+            );
+        } else {
+            state.world.broadcast_all(
+                generated_packets::play::clientbound::TELEPORT_ENTITY,
+                encode_teleport_entity(mob.entity_id, mob.position, mob.yaw_deg, 0.0, true),
+            );
+        }
+    }
+    for (pid, vitals) in outcome.xp_updates {
+        state.world.send_direct(
+            pid,
+            generated_packets::play::clientbound::SET_EXPERIENCE,
+            encode_set_experience(vitals.xp_progress, vitals.xp_level, vitals.total_xp),
         );
     }
     for (victim, hurt_yaw) in outcome.zombie_hits {
